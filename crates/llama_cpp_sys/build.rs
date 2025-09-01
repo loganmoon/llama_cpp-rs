@@ -753,6 +753,8 @@ mod compat {
     use crate::*;
 
     pub fn redefine_symbols(out_path: impl AsRef<Path>, additional_lib: Option<&str>) {
+        println!("cargo:warning=Starting symbol renaming process...");
+        
         let (ggml_lib_name, llama_lib_name) = lib_names();
         let (nm, objcopy) = tools();
         
@@ -763,10 +765,7 @@ mod compat {
             "libggml_backend.a"
         };
         
-        println!(
-            "Modifying {ggml_lib_name}, {ggml_backend_lib_name} and {llama_lib_name}, symbols acquired via \
-        \"{nm}\" and modified via \"{objcopy}\""
-        );
+        println!("cargo:warning=Modifying {ggml_lib_name}, {ggml_backend_lib_name} and {llama_lib_name}, symbols acquired via \"{nm}\" and modified via \"{objcopy}\"");
 
         // Modifying symbols exposed by the ggml library
 
@@ -780,34 +779,83 @@ mod compat {
                 },
                 Filter {
                     prefix: "ggml",
+                    sym_type: 't',  // local text symbols
+                },
+                Filter {
+                    prefix: "ggml",
                     sym_type: 'U',
+                },
+                Filter {
+                    prefix: "ggml",
+                    sym_type: 'u',  // local undefined symbols
                 },
                 Filter {
                     prefix: "ggml",
                     sym_type: 'B',
                 },
                 Filter {
+                    prefix: "ggml",
+                    sym_type: 'b',  // local bss symbols
+                },
+                Filter {
                     prefix: "gguf",
                     sym_type: 'T',
+                },
+                Filter {
+                    prefix: "gguf",
+                    sym_type: 't',
                 },
                 Filter {
                     prefix: "quantize",
                     sym_type: 'T',
                 },
                 Filter {
+                    prefix: "quantize",
+                    sym_type: 't',
+                },
+                Filter {
                     prefix: "dequantize",
                     sym_type: 'T',
+                },
+                Filter {
+                    prefix: "dequantize",
+                    sym_type: 't',
                 },
                 Filter {
                     prefix: "iq2xs",
                     sym_type: 'T',
                 },
                 Filter {
+                    prefix: "iq2xs",
+                    sym_type: 't',
+                },
+                Filter {
+                    prefix: "iq2xs",
+                    sym_type: 'r',  // read-only data
+                },
+                Filter {
+                    prefix: "iq2xs",
+                    sym_type: 'R',  // global read-only data
+                },
+                Filter {
                     prefix: "iq3xs",
                     sym_type: 'T',
                 },
+                Filter {
+                    prefix: "iq3xs",
+                    sym_type: 't',
+                },
+                Filter {
+                    prefix: "iq3xs",
+                    sym_type: 'r',  // read-only data
+                },
+                Filter {
+                    prefix: "iq3xs",
+                    sym_type: 'R',  // global read-only data
+                },
             ],
         );
+        println!("cargo:warning=Found {} symbols in {ggml_lib_name} to rename", symbols.len());
         objcopy_redefine(&objcopy, ggml_lib_name, PREFIX, symbols, &out_path);
         
         // Modifying symbols exposed by the ggml backend library
@@ -821,7 +869,31 @@ mod compat {
                 },
                 Filter {
                     prefix: "ggml",
+                    sym_type: 't',
+                },
+                Filter {
+                    prefix: "ggml",
                     sym_type: 'U',
+                },
+                Filter {
+                    prefix: "ggml",
+                    sym_type: 'u',
+                },
+                Filter {
+                    prefix: "gguf",
+                    sym_type: 'T',
+                },
+                Filter {
+                    prefix: "gguf",
+                    sym_type: 't',
+                },
+                Filter {
+                    prefix: "gguf",
+                    sym_type: 'U',
+                },
+                Filter {
+                    prefix: "gguf",
+                    sym_type: 'u',
                 },
             ],
         );
@@ -867,7 +939,31 @@ mod compat {
                     },
                     Filter {
                         prefix: "ggml",
+                        sym_type: 'u',
+                    },
+                    Filter {
+                        prefix: "ggml",
                         sym_type: 'T',
+                    },
+                    Filter {
+                        prefix: "ggml",
+                        sym_type: 't',
+                    },
+                    Filter {
+                        prefix: "gguf",
+                        sym_type: 'U',
+                    },
+                    Filter {
+                        prefix: "gguf",
+                        sym_type: 'u',
+                    },
+                    Filter {
+                        prefix: "gguf",
+                        sym_type: 'T',
+                    },
+                    Filter {
+                        prefix: "gguf",
+                        sym_type: 't',
                     },
                 ],
             );
@@ -1065,10 +1161,18 @@ mod compat {
         symbols: HashSet<&str>,
         out_path: impl AsRef<Path>,
     ) {
+        println!("cargo:warning=Running objcopy on {target_lib} to rename {} symbols", symbols.len());
+        
         let mut cmd = Command::new(tool.to_string());
         cmd.current_dir(&out_path);
-        for symbol in symbols {
+        for symbol in &symbols {
             cmd.arg(format!("--redefine-sym={symbol}={prefix}{symbol}"));
+        }
+        
+        // Debug: Show first few symbol renames
+        let sample_symbols: Vec<_> = symbols.iter().take(3).collect();
+        for sym in sample_symbols {
+            println!("cargo:warning=  Example rename: {sym} -> {prefix}{sym}");
         }
 
         let output = cmd
@@ -1083,6 +1187,8 @@ mod compat {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        
+        println!("cargo:warning=objcopy completed successfully for {target_lib}");
     }
 
     /// A filter for a symbol in a library.
