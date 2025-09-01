@@ -619,6 +619,20 @@ fn compile_ggml(mut cx: Build) {
         .compile("ggml");
 }
 
+fn compile_ggml_backend(mut cxx: Build) {
+    println!("Compiling GGML Backend..");
+    cxx.std("c++17")
+        .include(LLAMA_PATH.join("ggml/include").as_path())
+        .include(LLAMA_PATH.join("ggml/src").as_path())
+        .define("GGML_VERSION", "\"0.0.0\"")
+        .define("GGML_COMMIT", "\"unknown\"")
+        .file(LLAMA_PATH.join("ggml/src/ggml-backend.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-backend-reg.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/gguf.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-opt.cpp"))
+        .compile("ggml_backend");
+}
+
 fn compile_llama(mut cxx: Build, _out_path: impl AsRef<Path>) {
     println!("Compiling Llama.cpp..");
     
@@ -711,6 +725,7 @@ fn main() {
     };
 
     compile_ggml(cx);
+    compile_ggml_backend(cxx.clone());
     compile_llama(cxx, &out_path);
 
     #[cfg(all(
@@ -740,8 +755,16 @@ mod compat {
     pub fn redefine_symbols(out_path: impl AsRef<Path>, additional_lib: Option<&str>) {
         let (ggml_lib_name, llama_lib_name) = lib_names();
         let (nm, objcopy) = tools();
+        
+        // Also get the backend library name
+        let ggml_backend_lib_name = if cfg!(target_family = "windows") {
+            "ggml_backend.lib"
+        } else {
+            "libggml_backend.a"
+        };
+        
         println!(
-            "Modifying {ggml_lib_name} and {llama_lib_name}, symbols acquired via \
+            "Modifying {ggml_lib_name}, {ggml_backend_lib_name} and {llama_lib_name}, symbols acquired via \
         \"{nm}\" and modified via \"{objcopy}\""
         );
 
@@ -786,6 +809,23 @@ mod compat {
             ],
         );
         objcopy_redefine(&objcopy, ggml_lib_name, PREFIX, symbols, &out_path);
+        
+        // Modifying symbols exposed by the ggml backend library
+        let out_str = nm_symbols(&nm, ggml_backend_lib_name, &out_path);
+        let symbols = get_symbols(
+            &out_str,
+            [
+                Filter {
+                    prefix: "ggml",
+                    sym_type: 'T',
+                },
+                Filter {
+                    prefix: "ggml",
+                    sym_type: 'U',
+                },
+            ],
+        );
+        objcopy_redefine(&objcopy, ggml_backend_lib_name, PREFIX, symbols, &out_path);
 
         // Modifying the symbols llama depends on from ggml
 
