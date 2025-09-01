@@ -13,8 +13,8 @@ use tracing::{error, info, trace, warn};
 
 use llama_cpp_sys::{
     llama_context, llama_copy_state_data, llama_decode, llama_free, llama_get_logits_ith,
-    llama_get_state_size, llama_kv_cache_seq_rm, llama_set_state_data, llama_token_data,
-    llama_token_data_array,
+    llama_get_memory, llama_get_state_size, llama_memory_seq_rm, llama_set_state_data,
+    llama_token_data, llama_token_data_array,
 };
 
 use crate::standard_sampler::StandardSampler;
@@ -283,7 +283,8 @@ impl LlamaSession {
             if session.inner.last_batch_size.load(Ordering::SeqCst) == 0 {
                 // Remove last token
                 unsafe {
-                    llama_kv_cache_seq_rm(**context, -1, token_buf.len() as i32 - 1, -1);
+                    let memory = llama_get_memory(**context);
+                    llama_memory_seq_rm(memory, -1, token_buf.len() as i32 - 1, -1);
                 }
 
                 // Decode last token
@@ -325,6 +326,7 @@ impl LlamaSession {
                     data: candidates.as_mut_ptr(),
                     size: vocab,
                     sorted: false,
+                    selected: -1,  // -1 means no token selected yet
                 };
 
                 // Select the next token
@@ -414,7 +416,8 @@ impl LlamaSession {
         let success = unsafe {
             let context = self.inner.ctx.lock().unwrap();
 
-            llama_kv_cache_seq_rm(**context, -1, start_bound, end_bound)
+            let memory = llama_get_memory(**context);
+            llama_memory_seq_rm(memory, -1, start_bound, end_bound)
         };
 
         if !success {

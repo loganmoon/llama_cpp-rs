@@ -3,8 +3,8 @@
 use std::ptr::null_mut;
 
 use llama_cpp_sys::{
-    ggml_type, llama_context_default_params, llama_context_params, llama_pooling_type,
-    llama_rope_scaling_type,
+    ggml_type, llama_attention_type, llama_context_default_params, llama_context_params,
+    llama_flash_attn_type, llama_pooling_type, llama_rope_scaling_type,
 };
 
 /// whether to pool (sum) embedding results by sequence id (ignored if no pooling layer)
@@ -219,8 +219,8 @@ impl From<ggml_type> for CacheType {
 /// Session-specific parameters.
 #[derive(Clone)]
 pub struct SessionParams {
-    /// RNG seed, [`u32::MAX`] for random (default)
-    pub seed: u32,
+    // seed has been removed from context params in new API
+    // pub seed: u32,
 
     /// text context, 0 = from model
     pub n_ctx: u32,
@@ -295,7 +295,6 @@ impl Default for SessionParams {
         let threads = num_cpus::get_physical() as u32 - 1;
 
         Self {
-            seed: c_defaults.seed,
             n_ctx: c_defaults.n_ctx,
             n_batch: c_defaults.n_batch,
             n_ubatch: c_defaults.n_ubatch,
@@ -323,13 +322,12 @@ impl Default for SessionParams {
 impl From<SessionParams> for llama_context_params {
     fn from(value: SessionParams) -> Self {
         Self {
-            seed: value.seed,
             n_ctx: value.n_ctx,
             n_batch: value.n_batch,
             n_ubatch: value.n_ubatch,
             n_seq_max: value.n_seq_max,
-            n_threads: value.n_threads,
-            n_threads_batch: value.n_threads_batch,
+            n_threads: value.n_threads as i32,
+            n_threads_batch: value.n_threads_batch as i32,
             rope_scaling_type: value.rope_scaling_type.into(),
             rope_freq_base: value.rope_freq_base,
             rope_freq_scale: value.rope_freq_scale,
@@ -343,12 +341,19 @@ impl From<SessionParams> for llama_context_params {
             cb_eval_user_data: null_mut(),
             type_k: value.type_k.into(),
             type_v: value.type_v.into(),
-            logits_all: false, // Deprecated
+            // logits_all field has been removed in new API
             embeddings: value.embedding,
             offload_kqv: value.offload_kqv,
             pooling_type: value.pooling.into(),
             abort_callback: None,
             abort_callback_data: null_mut(),
+            // New fields in the updated API
+            attention_type: llama_attention_type::LLAMA_ATTENTION_TYPE_CAUSAL,  // Default causal attention
+            flash_attn_type: llama_flash_attn_type::LLAMA_FLASH_ATTN_TYPE_AUTO,  // Auto-detect flash attention
+            no_perf: false,  // Enable performance tracking by default
+            op_offload: false,  // Don't offload operations by default
+            swa_full: false,  // Don't use sliding window attention full mode
+            kv_unified: false,  // Don't use unified KV cache by default
         }
     }
 }
@@ -356,13 +361,12 @@ impl From<SessionParams> for llama_context_params {
 impl From<llama_context_params> for SessionParams {
     fn from(value: llama_context_params) -> Self {
         Self {
-            seed: value.seed,
             n_ctx: value.n_ctx,
             n_batch: value.n_batch,
             n_ubatch: value.n_ubatch,
             n_seq_max: value.n_seq_max,
-            n_threads: value.n_threads,
-            n_threads_batch: value.n_threads_batch,
+            n_threads: value.n_threads as u32,
+            n_threads_batch: value.n_threads_batch as u32,
             rope_scaling_type: value.rope_scaling_type.into(),
             rope_freq_base: value.rope_freq_base,
             rope_freq_scale: value.rope_freq_scale,

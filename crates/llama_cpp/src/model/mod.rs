@@ -15,12 +15,12 @@ use tracing::{error, info, trace, warn};
 
 use backend::BackendRef;
 use llama_cpp_sys::{
-    ggml_row_size, llama_context, llama_context_params, llama_decode, llama_free_model,
-    llama_get_embeddings_ith, llama_get_embeddings_seq, llama_kv_cache_clear,
-    llama_load_model_from_file, llama_model, llama_model_meta_val_str, llama_n_ctx_train,
-    llama_n_embd, llama_n_vocab, llama_new_context_with_model, llama_token, llama_token_bos,
-    llama_token_eos, llama_token_eot, llama_token_get_text, llama_token_middle, llama_token_nl,
-    llama_token_prefix, llama_token_suffix, llama_token_to_piece, llama_tokenize,
+    ggml_row_size, llama_context, llama_context_params, llama_decode, llama_model_free,
+    llama_get_embeddings_ith, llama_get_embeddings_seq, llama_get_memory, llama_memory_clear,
+    llama_model_get_vocab, llama_model_load_from_file, llama_model, llama_model_meta_val_str,
+    llama_n_ctx_train, llama_n_embd, llama_n_vocab, llama_init_from_model, llama_token,
+    llama_token_bos, llama_token_cls, llama_token_eos, llama_token_eot, llama_token_get_text,
+    llama_token_nl, llama_token_prefix, llama_token_suffix, llama_token_to_piece, llama_tokenize,
 };
 pub use params::*;
 
@@ -84,7 +84,7 @@ impl Drop for LlamaModelInner {
             // `free`d yet.
             //
             // [1]: See https://github.com/rust-lang/rust/issues/60977
-            llama_free_model(self.model);
+            llama_model_free(self.model);
         }
     }
 }
@@ -173,10 +173,10 @@ impl LlamaModel {
 
         let model = unsafe {
             // SAFETY: Assume that llama.cpp will gracefully fail and return `nullptr` if
-            // `llama_load_model_from_file` fails.
+            // `llama_model_load_from_file` fails.
             //
             // This is, unfortunately, the best we can do here.
-            llama_load_model_from_file(
+            llama_model_load_from_file(
                 CString::new(file_path.to_string_lossy().into_owned().into_bytes())
                     .unwrap_or_else(|_| {
                         unreachable!(
@@ -194,7 +194,8 @@ impl LlamaModel {
         } else {
             let vocabulary_size = unsafe {
                 // SAFETY: `model` is not null.
-                llama_n_vocab(model)
+                let vocab = llama_model_get_vocab(model);
+                llama_n_vocab(vocab)
             };
 
             let n_embd = unsafe { llama_n_embd(model) } as usize;
@@ -233,13 +234,34 @@ impl LlamaModel {
                     _backend_ref: backend_ref,
                 })),
                 vocabulary_size: vocabulary_size as usize,
-                bos_token: Token(unsafe { llama_token_bos(model) }),
-                eos_token: Token(unsafe { llama_token_eos(model) }),
-                nl_token: Token(unsafe { llama_token_nl(model) }),
-                infill_prefix_token: Token(unsafe { llama_token_prefix(model) }),
-                infill_middle_token: Token(unsafe { llama_token_middle(model) }),
-                infill_suffix_token: Token(unsafe { llama_token_suffix(model) }),
-                eot_token: Token(unsafe { llama_token_eot(model) }),
+                bos_token: Token(unsafe { 
+                    let vocab = llama_model_get_vocab(model);
+                    llama_token_bos(vocab)
+                }),
+                eos_token: Token(unsafe {
+                    let vocab = llama_model_get_vocab(model);
+                    llama_token_eos(vocab)
+                }),
+                nl_token: Token(unsafe {
+                    let vocab = llama_model_get_vocab(model);
+                    llama_token_nl(vocab)
+                }),
+                infill_prefix_token: Token(unsafe {
+                    let vocab = llama_model_get_vocab(model);
+                    llama_token_prefix(vocab)
+                }),
+                infill_middle_token: Token(unsafe {
+                    let vocab = llama_model_get_vocab(model);
+                    llama_token_cls(vocab)  // llama_token_middle was renamed to llama_token_cls
+                }),
+                infill_suffix_token: Token(unsafe {
+                    let vocab = llama_model_get_vocab(model);
+                    llama_token_suffix(vocab)
+                }),
+                eot_token: Token(unsafe {
+                    let vocab = llama_model_get_vocab(model);
+                    llama_token_eot(vocab)
+                }),
                 embedding_length: n_embd,
                 training_size: unsafe { llama_n_ctx_train(model) } as usize,
                 layers,
@@ -305,8 +327,9 @@ impl LlamaModel {
             // `content.len()` always fits within an `i32`.
             //
             // `out_buf` is a `Vec<Token>`, and `Token` is `#[repr(transparent)]` over an `i32`.
+            let vocab = llama_model_get_vocab(**model_lock);
             llama_tokenize(
-                **model_lock,
+                vocab,
                 content.as_ptr() as *const c_char,
                 content.len() as i32,
                 out_buf.as_mut_ptr() as *mut llama_token,
@@ -364,7 +387,8 @@ impl LlamaModel {
 
         unsafe {
             let model_lock = self.model.lock().unwrap();
-            CStr::from_ptr(llama_token_get_text(**model_lock, token.0))
+            let vocab = llama_model_get_vocab(**model_lock);
+            CStr::from_ptr(llama_token_get_text(vocab, token.0))
         }
         .to_bytes()
     }
@@ -379,11 +403,14 @@ impl LlamaModel {
         let size = unsafe {
             // SAFETY: Casting `*mut u8` to `*mut i8` is safe because `u8` and
             // `i8` have the same size and alignment.
+            let vocab = llama_model_get_vocab(**model_lock);
             llama_token_to_piece(
-                **model_lock,
+                vocab,
                 token.0,
                 buffer.as_mut_ptr() as *mut c_char,
                 std::os::raw::c_int::from(initial_size),
+                0,  // lstrip parameter
+                false,  // special parameter
             )
         };
 
@@ -393,11 +420,14 @@ impl LlamaModel {
                 // SAFETY: Casting `*mut u8` to `*mut i8` is safe because `u8`
                 // and `i8` have the same size and alignment. The length of
                 // buffer is accurate for this reason.
+                let vocab = llama_model_get_vocab(**model_lock);
                 llama_token_to_piece(
-                    **model_lock,
+                    vocab,
                     token.0,
                     buffer.as_mut_ptr() as *mut c_char,
                     std::os::raw::c_int::from(buffer.len() as i32),
+                    0,  // lstrip parameter
+                    false,  // special parameter
                 )
             };
             assert_eq!(size as usize, buffer.len(), "Buffer length doesn't match");
@@ -437,11 +467,14 @@ impl LlamaModel {
                 // SAFETY: Casting `*mut u8` to `*mut i8` is safe because `u8` and
                 // `i8` have the same size and alignment. The length of token_buf is
                 // accurate for this reason.
+                let vocab = llama_model_get_vocab(**model_lock);
                 llama_token_to_piece(
-                    **model_lock,
+                    vocab,
                     t.0,
                     token_buf.as_mut_ptr() as *mut c_char,
                     token_buf.len() as i32,
+                    0,  // lstrip parameter
+                    false,  // special parameter
                 )
             };
 
@@ -480,7 +513,7 @@ impl LlamaModel {
 
             // SAFETY: due to `_model` being declared in the `LlamaContext`, `self` must live
             // for at least the lifetime of `LlamaContext`.
-            llama_new_context_with_model(**model_lock, params)
+            llama_init_from_model(**model_lock, params)
         };
         if ctx.is_null() {
             return Err(LlamaContextError::SessionFailed);
@@ -572,7 +605,8 @@ impl LlamaModel {
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
         let res = unsafe {
             // clear previous kv_cache values (irrelevant for embeddings)
-            llama_kv_cache_clear(context);
+            let memory = llama_get_memory(context);
+            llama_memory_clear(memory, false);
             llama_decode(context, batch.handle())
         };
 
@@ -659,7 +693,7 @@ impl LlamaModel {
 
             // SAFETY: due to `_model` being declared in the `LlamaContext`, `self` must live
             // for at least the lifetime of `LlamaContext`.
-            llama_new_context_with_model(**model_lock, context_params)
+            llama_init_from_model(**model_lock, context_params)
         };
 
         if context.is_null() {
@@ -722,8 +756,6 @@ impl LlamaModel {
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
         let inputs = self.tokenize_slice(inputs, true, false)?;
         let model = self.clone();
-
-        self.
 
         tokio::task::spawn_blocking(move || model.embeddings_process(inputs, params))
             .await

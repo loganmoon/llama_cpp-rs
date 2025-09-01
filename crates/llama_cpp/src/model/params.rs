@@ -152,6 +152,8 @@ impl Default for LlamaParams {
 impl From<LlamaParams> for llama_model_params {
     fn from(value: LlamaParams) -> Self {
         llama_model_params {
+            devices: ptr::null_mut(),  // NULL-terminated device list
+            tensor_buft_overrides: ptr::null(),  // Tensor buffer overrides
             n_gpu_layers: value.n_gpu_layers as i32,
             split_mode: value.split_mode.into(),
             main_gpu: value.main_gpu as i32,
@@ -162,6 +164,8 @@ impl From<LlamaParams> for llama_model_params {
             vocab_only: value.vocab_only,
             use_mmap: value.use_mmap,
             use_mlock: value.use_mlock,
+            check_tensors: false,  // Don't validate tensor checksums by default
+            use_extra_bufts: false,  // Don't use extra buffers by default
         }
     }
 }
@@ -184,8 +188,8 @@ impl EmbeddingsParams {
         let mut ctx_params = unsafe { llama_context_default_params() };
 
         ctx_params.embeddings = true;
-        ctx_params.n_threads = self.n_threads;
-        ctx_params.n_threads_batch = self.n_threads_batch;
+        ctx_params.n_threads = self.n_threads as i32;
+        ctx_params.n_threads_batch = self.n_threads_batch as i32;
         ctx_params.n_ctx = batch_capacity as u32;
         ctx_params.n_batch = batch_capacity as u32;
         ctx_params.n_ubatch = batch_capacity as u32;
