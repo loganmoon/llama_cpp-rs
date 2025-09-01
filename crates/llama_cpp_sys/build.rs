@@ -103,6 +103,10 @@ fn compile_bindings(out_path: &Path) {
         .allowlist_type("ggml_.*")
         .allowlist_function("llama_.*")
         .allowlist_type("llama_.*")
+        // Ensure new sampler types and functions are included
+        .allowlist_function("llama_sampler_.*")
+        .allowlist_type("llama_sampler.*")
+        .allowlist_var("LLAMA_.*")
         .default_enum_style(EnumVariation::Rust {
             non_exhaustive: true,
         })
