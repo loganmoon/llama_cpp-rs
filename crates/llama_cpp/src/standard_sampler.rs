@@ -1,7 +1,7 @@
 use std::ptr::addr_of_mut;
 
 use llama_cpp_sys::{
-    llama_context, llama_token, llama_token_data_array,
+    llama_context, llama_get_model, llama_token, llama_token_data_array,
 };
 
 // The following sampling functions are deprecated in the new API:
@@ -13,7 +13,6 @@ use llama_cpp_sys::{
 
 use crate::{grammar::LlamaGrammar, Sampler, Token};
 
-#[cfg(feature = "use_new_sampler_api")]
 use crate::sampler_chain::{SamplerChain, SamplerChainError, SamplerType};
 
 /// Functions which modify the probability distribution output by the model.
@@ -143,16 +142,18 @@ impl SamplerStage {
         mut candidates_p: llama_token_data_array,
         min_keep: usize,
     ) -> llama_token_data_array {
-        // NOTE: The old sampling functions have been deprecated in llama.cpp
-        // This is a stub implementation - use the new sampler chain API instead
-        // Enable with feature = "use_new_sampler_api" and use sample_new() method
+        #[cfg(feature = "legacy_sampler_compatibility")]
+        {
+            unimplemented!("The old sampling API has been deprecated in llama.cpp. Use sample_new() or the SamplerChain API directly.")
+        }
         
-        let _ = (context, tokens, min_keep); // Suppress unused warnings
-        let _ = self; // Suppress unused warning
-        
-        // Return the candidates unchanged as a temporary measure
-        // The actual sampling should be done through the new sampler chain API
-        candidates_p
+        #[cfg(not(feature = "legacy_sampler_compatibility"))]
+        {
+            let _ = (context, tokens, min_keep, self);
+            // Without the legacy compatibility feature, this method shouldn't exist
+            // but we need it for the trait implementation
+            unimplemented!("Legacy sampling not available. Use sample_new() or SamplerChain API.")
+        }
     }
 }
 
@@ -171,14 +172,8 @@ impl GrammarStage {
         mut candidates_p: llama_token_data_array,
         _min_keep: usize,
     ) -> llama_token_data_array {
-        // NOTE: Grammar functions have been deprecated
-        // This is a stub - use the new sampler chain API with grammar sampler
-        
-        let _ = (context, tokens); // Suppress unused warnings
-        self.accepted_up_to = Some(tokens.len());
-        
-        // Return candidates unchanged as a stub
-        candidates_p
+        let _ = (context, tokens, self);
+        unimplemented!("Grammar API has been deprecated in llama.cpp. Use the new sampler chain with grammar sampler.")
     }
 }
 
@@ -210,20 +205,15 @@ impl TokenSelector {
         context: *mut llama_context,
         mut candidates_p: llama_token_data_array,
     ) -> Token {
-        // NOTE: The old token selection functions have been deprecated
-        // This is a stub - use the new sampler chain API instead
+        #[cfg(feature = "legacy_sampler_compatibility")]
+        {
+            unimplemented!("The old token selection API has been deprecated in llama.cpp. Use the SamplerChain API.")
+        }
         
-        let _ = (context, candidates_p); // Suppress unused warnings
-        let _ = self; // Suppress unused warning
-        
-        // Return the first token as a stub
-        // The actual selection should be done through the new sampler chain API
-        if candidates_p.size > 0 {
-            unsafe {
-                Token((*candidates_p.data).id)
-            }
-        } else {
-            Token(0) // Fallback token
+        #[cfg(not(feature = "legacy_sampler_compatibility"))]
+        {
+            let _ = (context, candidates_p, self);
+            unimplemented!("Legacy token selection not available. Use SamplerChain API.")
         }
     }
 }
@@ -253,8 +243,7 @@ impl StandardSampler {
     }
     
     /// Convert the StandardSampler configuration to a new sampler chain
-    #[cfg(feature = "use_new_sampler_api")]
-    fn to_sampler_chain(&self, seed: u32) -> Result<SamplerChain, SamplerChainError> {
+    fn to_sampler_chain(&self, context: *mut llama_context, seed: u32) -> Result<SamplerChain, SamplerChainError> {
         let mut chain = SamplerChain::new()?;
         
         // Add stages in order
@@ -305,10 +294,11 @@ impl StandardSampler {
                     // TailFree is not supported in the new API, skip it
                     // TODO: Log a warning or handle this case differently
                 }
-                SamplerStage::Grammar(_stage) => {
-                    // Grammar requires special handling with the model pointer
-                    // For now, we'll skip it and handle it separately
-                    // TODO: Implement grammar support
+                SamplerStage::Grammar(stage) => {
+                    // Get the model from the context to create the grammar sampler
+                    let model = unsafe { llama_get_model(context) };
+                    let sampler_type = stage.grammar.to_sampler_type(model);
+                    chain.add(sampler_type)?;
                 }
             }
         }
@@ -379,7 +369,6 @@ impl StandardSampler {
     }
     
     /// Sample using the new sampler chain API
-    #[cfg(feature = "use_new_sampler_api")]
     pub fn sample_new(
         &mut self,
         context: *mut llama_context,
@@ -387,7 +376,7 @@ impl StandardSampler {
         _candidates_p: llama_token_data_array,
     ) -> Token {
         // Use a fixed seed for now, could be made configurable
-        let mut chain = self.to_sampler_chain(42).expect("Failed to create sampler chain");
+        let mut chain = self.to_sampler_chain(context, 42).expect("Failed to create sampler chain");
         
         // Accept previous tokens for context
         for token in tokens {

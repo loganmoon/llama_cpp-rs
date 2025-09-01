@@ -4,13 +4,14 @@
 //! architecture in llama.cpp.
 
 use llama_cpp_sys::{
-    llama_context, llama_sampler, llama_sampler_accept, llama_sampler_chain_add,
-    llama_sampler_chain_default_params, llama_sampler_chain_init, llama_sampler_chain_n,
-    llama_sampler_chain_params, llama_sampler_free, llama_sampler_init_dist,
-    llama_sampler_init_greedy, llama_sampler_init_min_p, llama_sampler_init_mirostat,
-    llama_sampler_init_mirostat_v2, llama_sampler_init_penalties, llama_sampler_init_temp,
-    llama_sampler_init_temp_ext, llama_sampler_init_top_k, llama_sampler_init_top_p,
-    llama_sampler_init_typical, llama_sampler_reset, llama_sampler_sample, llama_token,
+    llama_context, llama_model, llama_model_get_vocab, llama_sampler, llama_sampler_accept,
+    llama_sampler_chain_add, llama_sampler_chain_default_params, llama_sampler_chain_init,
+    llama_sampler_chain_n, llama_sampler_chain_params, llama_sampler_free,
+    llama_sampler_init_dist, llama_sampler_init_grammar, llama_sampler_init_greedy,
+    llama_sampler_init_min_p, llama_sampler_init_mirostat, llama_sampler_init_mirostat_v2,
+    llama_sampler_init_penalties, llama_sampler_init_temp, llama_sampler_init_temp_ext,
+    llama_sampler_init_top_k, llama_sampler_init_top_p, llama_sampler_init_typical,
+    llama_sampler_reset, llama_sampler_sample, llama_token, llama_vocab,
 };
 use std::ptr::NonNull;
 
@@ -54,7 +55,11 @@ pub enum SamplerType {
         penalty_present: f32,
     },
     /// Grammar-constrained sampling
-    Grammar { grammar: NonNull<llama_sampler> },
+    Grammar {
+        vocab: *const llama_vocab,
+        grammar_str: String,
+        grammar_root: Option<String>,
+    },
     /// Mirostat sampling v1
     Mirostat { tau: f32, eta: f32, m: i32 },
     /// Mirostat sampling v2
@@ -131,9 +136,29 @@ impl SamplerChain {
                     )
                 }
             }
-            SamplerType::Grammar { grammar } => {
-                // Grammar is already a sampler, just return it
-                grammar.as_ptr()
+            SamplerType::Grammar { vocab, grammar_str, grammar_root } => {
+                use std::ffi::CString;
+                let grammar_cstr = CString::new(grammar_str)
+                    .map_err(|_| SamplerChainError::InvalidParameter("Invalid grammar string".to_string()))?;
+                let root_cstr = match grammar_root {
+                    Some(root) => {
+                        let cstr = CString::new(root)
+                            .map_err(|_| SamplerChainError::InvalidParameter("Invalid grammar root".to_string()))?;
+                        Some(cstr)
+                    }
+                    None => None,
+                };
+                
+                // Grammar creation needs to be handled specially
+                // since we need to return from the outer function on error
+                let sampler = unsafe {
+                    llama_sampler_init_grammar(
+                        vocab,
+                        grammar_cstr.as_ptr(),
+                        root_cstr.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+                    )
+                };
+                sampler
             }
             SamplerType::Mirostat { tau, eta, m } => {
                 // mirostat v1 needs n_vocab and seed parameters
