@@ -19,8 +19,8 @@ use llama_cpp_sys::{
     llama_get_embeddings_ith, llama_get_embeddings_seq, llama_get_memory, llama_memory_clear,
     llama_model_get_vocab, llama_model_load_from_file, llama_model, llama_model_meta_val_str,
     llama_n_ctx_train, llama_n_embd, llama_n_vocab, llama_init_from_model, llama_token,
-    llama_token_bos, llama_token_cls, llama_token_eos, llama_token_eot, llama_token_get_text,
-    llama_token_nl, llama_token_prefix, llama_token_suffix, llama_token_to_piece, llama_tokenize,
+    llama_token_bos, llama_token_cls, llama_token_eos, llama_token_eot, llama_token_fim_pre,
+    llama_token_fim_suf, llama_token_get_text, llama_token_nl, llama_token_to_piece, llama_tokenize,
 };
 pub use params::*;
 
@@ -248,7 +248,7 @@ impl LlamaModel {
                 }),
                 infill_prefix_token: Token(unsafe {
                     let vocab = llama_model_get_vocab(model);
-                    llama_token_prefix(vocab)
+                    llama_token_fim_pre(vocab)
                 }),
                 infill_middle_token: Token(unsafe {
                     let vocab = llama_model_get_vocab(model);
@@ -256,7 +256,7 @@ impl LlamaModel {
                 }),
                 infill_suffix_token: Token(unsafe {
                     let vocab = llama_model_get_vocab(model);
-                    llama_token_suffix(vocab)
+                    llama_token_fim_suf(vocab)
                 }),
                 eot_token: Token(unsafe {
                     let vocab = llama_model_get_vocab(model);
