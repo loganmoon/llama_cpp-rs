@@ -92,9 +92,12 @@ mod model;
 mod session;
 
 pub use model::*;
+pub use sampler_chain::{SamplerChain, SamplerChainBuilder, SamplerType};
 pub use session::*;
 
 pub mod grammar;
+/// The new sampler chain API wrapper.
+pub mod sampler_chain;
 /// The standard sampler implementation.
 pub mod standard_sampler;
 
