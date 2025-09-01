@@ -22,6 +22,7 @@ tracing = "0.1.40"
 default = ["compat", "native"]
 compat = ["llama_cpp_sys/compat"] # this feature modifies the symbols exposed by the generated libraries to avoid conflicts
 native = ["llama_cpp_sys/native", "avx", "avx2", "fma", "f16c", "accel"]
+use_new_sampler_api = []  # Enable the new sampler chain API compatibility layer
 avx = ["llama_cpp_sys/avx"]
 avx2 = ["llama_cpp_sys/avx2"]
 avx512 = ["llama_cpp_sys/avx512"]

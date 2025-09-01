@@ -10,6 +10,9 @@ use llama_cpp_sys::{
 
 use crate::{grammar::LlamaGrammar, Sampler, Token};
 
+#[cfg(feature = "use_new_sampler_api")]
+use crate::sampler_chain::{SamplerChain, SamplerChainError, SamplerType};
+
 /// Functions which modify the probability distribution output by the model.
 ///
 /// Standard ordering for samplers (taken from [kobold.cpp](https://github.com/LostRuins/koboldcpp)):
@@ -303,6 +306,82 @@ impl StandardSampler {
             token_selector: TokenSelector::Softmax,
         }
     }
+    
+    /// Convert the StandardSampler configuration to a new sampler chain
+    #[cfg(feature = "use_new_sampler_api")]
+    fn to_sampler_chain(&self, seed: u32) -> Result<SamplerChain, SamplerChainError> {
+        let mut chain = SamplerChain::new()?;
+        
+        // Add stages in order
+        for stage in &self.stages {
+            match stage {
+                SamplerStage::RepetitionPenalty { 
+                    repetition_penalty, 
+                    frequency_penalty,
+                    presence_penalty, 
+                    last_n 
+                } => {
+                    chain.add(SamplerType::Penalties {
+                        tokens: vec![],  // Will be populated during sampling
+                        penalty_last_n: *last_n,
+                        penalty_repeat: *repetition_penalty,
+                        penalty_freq: *frequency_penalty,
+                        penalty_present: *presence_penalty,
+                    })?;
+                }
+                SamplerStage::Temperature(t) => {
+                    if *t == 0.0 {
+                        // Temperature 0 means greedy sampling
+                        chain.add(SamplerType::TopK { k: 1 })?;
+                    } else {
+                        chain.add(SamplerType::Temperature { t: *t })?;
+                    }
+                }
+                SamplerStage::DynamicTemperature { min_temp, max_temp, exponent_val } => {
+                    chain.add(SamplerType::TempExt { 
+                        t: *min_temp, 
+                        delta: *max_temp - *min_temp, 
+                        exponent: *exponent_val 
+                    })?;
+                }
+                SamplerStage::TopK(k) => {
+                    chain.add(SamplerType::TopK { k: *k })?;
+                }
+                SamplerStage::TopP(p) => {
+                    chain.add(SamplerType::TopP { p: *p, min_keep: self.min_keep })?;
+                }
+                SamplerStage::MinP(p) => {
+                    chain.add(SamplerType::MinP { p: *p, min_keep: self.min_keep })?;
+                }
+                SamplerStage::Typical(p) => {
+                    chain.add(SamplerType::Typical { p: *p, min_keep: self.min_keep })?;
+                }
+                SamplerStage::TailFree(_z) => {
+                    // TailFree is not supported in the new API, skip it
+                    // TODO: Log a warning or handle this case differently
+                }
+                SamplerStage::Grammar(_stage) => {
+                    // Grammar requires special handling with the model pointer
+                    // For now, we'll skip it and handle it separately
+                    // TODO: Implement grammar support
+                }
+            }
+        }
+        
+        // Add final token selector
+        match &self.token_selector {
+            TokenSelector::Greedy => chain.add(SamplerType::Greedy)?,
+            TokenSelector::Softmax => chain.add(SamplerType::Dist { seed })?,
+            TokenSelector::Mirostat { tau, eta, m, mu: _ } => {
+                chain.add(SamplerType::Mirostat { tau: *tau, eta: *eta, m: *m })?;
+            }
+            TokenSelector::MirostatV2 { tau, eta, mu: _ } => {
+                chain.add(SamplerType::MirostatV2 { tau: *tau, eta: *eta })?;
+            }
+        }
+        
+        Ok(chain)
+    }
 
     /// Creates a new [`StandardSampler`] that always selects the next most
     /// token produced by the model.
@@ -352,6 +431,29 @@ impl StandardSampler {
                 mu: 2.0 * tau,
             },
         }
+    }
+    
+    /// Sample using the new sampler chain API
+    #[cfg(feature = "use_new_sampler_api")]
+    pub fn sample_new(
+        &mut self,
+        context: *mut llama_context,
+        tokens: &[Token],
+        _candidates_p: llama_token_data_array,
+    ) -> Token {
+        // Use a fixed seed for now, could be made configurable
+        let mut chain = self.to_sampler_chain(42).expect("Failed to create sampler chain");
+        
+        // Accept previous tokens for context
+        for token in tokens {
+            chain.accept(*token);
+        }
+        
+        // Sample next token
+        let token = chain.sample(context, -1);
+        chain.accept(token);
+        
+        token
     }
 }
 
