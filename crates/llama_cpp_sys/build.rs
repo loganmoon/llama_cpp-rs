@@ -94,8 +94,10 @@ static LLAMA_PATH: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("./thirdparty/llam
 fn compile_bindings(out_path: &Path) {
     println!("Generating bindings..");
     let mut bindings = bindgen::Builder::default()
-        .header(LLAMA_PATH.join("ggml.h").to_string_lossy())
-        .header(LLAMA_PATH.join("llama.h").to_string_lossy())
+        .header(LLAMA_PATH.join("ggml/include/ggml.h").to_string_lossy())
+        .header(LLAMA_PATH.join("include/llama.h").to_string_lossy())
+        .clang_arg(format!("-I{}", LLAMA_PATH.join("ggml/include").display()))
+        .clang_arg(format!("-I{}", LLAMA_PATH.join("include").display()))
         .derive_partialeq(true)
         .allowlist_function("ggml_.*")
         .allowlist_type("ggml_.*")
@@ -344,7 +346,7 @@ fn compile_opencl(cx: &mut Build, cxx: &mut Build) {
         println!("cargo:rustc-link-lib=clblast");
     }
 
-    cxx.file(LLAMA_PATH.join("ggml-opencl.cpp"));
+    cxx.file(LLAMA_PATH.join("ggml/src/ggml-opencl.cpp"));
 }
 
 fn compile_openblas(cx: &mut Build) {
@@ -386,8 +388,8 @@ fn compile_hipblas(cx: &mut Build, cxx: &mut Build, mut hip: Build) -> &'static 
     let rocm_hip_bin = rocm_path.join("bin/hipcc");
 
     let cuda_lib = "ggml-cuda";
-    let cuda_file = cuda_lib.to_string() + ".cu";
-    let cuda_header = cuda_lib.to_string() + ".h";
+    let cuda_file = "ggml/src/".to_string() + cuda_lib + ".cu";
+    let cuda_header = "ggml/include/".to_string() + cuda_lib + ".h";
 
     let defines = ["GGML_USE_HIPBLAS", "GGML_USE_CUBLAS"];
     for def in defines {
@@ -399,7 +401,7 @@ fn compile_hipblas(cx: &mut Build, cxx: &mut Build, mut hip: Build) -> &'static 
     cxx.include(&rocm_include);
 
     hip.compiler(rocm_hip_bin)
-        .std("c++11")
+        .std("c++17")
         .file(LLAMA_PATH.join(cuda_file))
         .include(LLAMA_PATH.join(cuda_header))
         .define("GGML_USE_HIPBLAS", None)
@@ -452,7 +454,7 @@ fn compile_cuda(cx: &mut Build, cxx: &mut Build, featless_cxx: Build) -> &'stati
     }
 
     let lib_name = "ggml-cuda";
-    let cuda_path = LLAMA_PATH.join("ggml-cuda");
+    let cuda_path = LLAMA_PATH.join("ggml/src/ggml-cuda");
     let cuda_sources = read_dir(cuda_path.as_path())
         .unwrap()
         .map(|f| f.unwrap())
@@ -460,9 +462,10 @@ fn compile_cuda(cx: &mut Build, cxx: &mut Build, featless_cxx: Build) -> &'stati
         .map(|entry| entry.path());
 
     nvcc.include(cuda_path.as_path())
-        .include(LLAMA_PATH.as_path())
+        .include(LLAMA_PATH.join("ggml/include").as_path())
+        .include(LLAMA_PATH.join("include").as_path())
         .files(cuda_sources)
-        .file(LLAMA_PATH.join("ggml-cuda.cu"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cuda.cu"))
         .compile(lib_name);
 
     lib_name
@@ -484,7 +487,7 @@ fn compile_metal(cx: &mut Build, cxx: &mut Build) {
     // It's idiomatic to use OUT_DIR for intermediate c/c++ artifacts
     let out_dir = env::var("OUT_DIR").unwrap();
 
-    let ggml_metal_shader_path = LLAMA_PATH.join("ggml-metal.metal");
+    let ggml_metal_shader_path = LLAMA_PATH.join("ggml/src/ggml-metal/ggml-metal.metal");
 
     // Create a temporary assembly file that will allow for static linking to the metal shader.
     let ggml_metal_embed_assembly_path = PathBuf::from(&out_dir).join("ggml-metal-embed.asm");
@@ -492,14 +495,18 @@ fn compile_metal(cx: &mut Build, cxx: &mut Build) {
         .expect("Failed to open ggml-metal-embed.asm file");
 
     let ggml_metal_shader_out_path = PathBuf::from(&out_dir).join("ggml-metal.metal");
-    let common = LLAMA_PATH.join("ggml-common.h");
+    let common = LLAMA_PATH.join("ggml/src/ggml-common.h");
 
     let input_file = File::open(ggml_metal_shader_path).expect("Failed to open input file");
-    let mut output_file = File::create(&ggml_metal_shader_out_path).expect("Failed to create output file");
+    let mut output_file =
+        File::create(&ggml_metal_shader_out_path).expect("Failed to create output file");
 
     let output = Command::new("sed")
         .arg("-e")
-        .arg(format!("/#include \"ggml-common.h\"/r {}", common.to_string_lossy()))
+        .arg(format!(
+            "/#include \"ggml-common.h\"/r {}",
+            common.to_string_lossy()
+        ))
         .arg("-e")
         .arg("/#include \"ggml-common.h\"/d")
         .stdin(input_file)
@@ -563,8 +570,8 @@ fn compile_metal(cx: &mut Build, cxx: &mut Build) {
     println!("cargo:rustc-link-search=native={}", &out_dir);
     println!("cargo:rustc-link-lib=static=ggml-metal-embed");
 
-    cx.include(LLAMA_PATH.join("ggml-metal.h"))
-        .file(LLAMA_PATH.join("ggml-metal.m"));
+    cx.include(LLAMA_PATH.join("ggml/include"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-metal/ggml-metal.m"));
 }
 
 fn compile_vulkan(cx: &mut Build, cxx: &mut Build) -> &'static str {
@@ -588,8 +595,9 @@ fn compile_vulkan(cx: &mut Build, cxx: &mut Build) -> &'static str {
 
     cxx.clone()
         .include("./thirdparty/Vulkan-Headers/include/")
-        .include(LLAMA_PATH.as_path())
-        .file(LLAMA_PATH.join("ggml-vulkan.cpp"))
+        .include(LLAMA_PATH.join("ggml/include").as_path())
+        .include(LLAMA_PATH.join("include").as_path())
+        .file(LLAMA_PATH.join("ggml/src/ggml-vulkan.cpp"))
         .compile(lib_name);
 
     lib_name
@@ -598,22 +606,59 @@ fn compile_vulkan(cx: &mut Build, cxx: &mut Build) -> &'static str {
 fn compile_ggml(mut cx: Build) {
     println!("Compiling GGML..");
     cx.std("c11")
-        .include(LLAMA_PATH.as_path())
-        .file(LLAMA_PATH.join("ggml.c"))
-        .file(LLAMA_PATH.join("ggml-alloc.c"))
-        .file(LLAMA_PATH.join("ggml-backend.c"))
-        .file(LLAMA_PATH.join("ggml-quants.c"))
+        .include(LLAMA_PATH.join("ggml/include").as_path())
+        .include(LLAMA_PATH.join("ggml/src").as_path())
+        .define("GGML_VERSION", "\"0.0.0\"")
+        .define("GGML_COMMIT", "\"unknown\"")
+        .file(LLAMA_PATH.join("ggml/src/ggml.c"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-alloc.c"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-quants.c"))
         .compile("ggml");
 }
 
 fn compile_llama(mut cxx: Build, _out_path: impl AsRef<Path>) {
     println!("Compiling Llama.cpp..");
-    cxx.std("c++11")
-        .include(LLAMA_PATH.as_path())
-        .file(LLAMA_PATH.join("unicode.cpp"))
-        .file(LLAMA_PATH.join("unicode-data.cpp"))
-        .file(LLAMA_PATH.join("llama.cpp"))
-        .compile("llama");
+    
+    // Get all llama source files from src/ directory
+    let llama_sources = vec![
+        "src/llama.cpp",
+        "src/llama-impl.cpp",
+        "src/llama-vocab.cpp",
+        "src/llama-grammar.cpp",
+        "src/llama-sampling.cpp",
+        "src/llama-model.cpp",
+        "src/llama-model-loader.cpp",
+        "src/llama-model-saver.cpp",
+        "src/llama-context.cpp",
+        "src/llama-kv-cache.cpp",
+        "src/llama-kv-cache-iswa.cpp",
+        "src/llama-batch.cpp",
+        "src/llama-adapter.cpp",
+        "src/llama-arch.cpp",
+        "src/llama-chat.cpp",
+        "src/llama-cparams.cpp",
+        "src/llama-graph.cpp",
+        "src/llama-hparams.cpp",
+        "src/llama-io.cpp",
+        "src/llama-memory.cpp",
+        "src/llama-memory-hybrid.cpp",
+        "src/llama-memory-recurrent.cpp",
+        "src/llama-mmap.cpp",
+        "src/llama-quant.cpp",
+        "src/unicode.cpp",
+        "src/unicode-data.cpp",
+    ];
+    
+    cxx.std("c++17")
+        .include(LLAMA_PATH.join("include").as_path())
+        .include(LLAMA_PATH.join("ggml/include").as_path())
+        .include(LLAMA_PATH.join("src").as_path());
+    
+    for source in llama_sources {
+        cxx.file(LLAMA_PATH.join(source));
+    }
+    
+    cxx.compile("llama");
 }
 
 fn main() {

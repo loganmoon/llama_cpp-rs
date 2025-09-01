@@ -4,7 +4,7 @@ use std::ptr;
 
 use llama_cpp_sys::{
     llama_context_default_params, llama_context_params, llama_model_default_params,
-    llama_model_params, llama_split_mode,
+    llama_model_params, llama_pooling_type, llama_split_mode,
 };
 
 /// Parameters for llama.
@@ -40,6 +40,9 @@ pub struct LlamaParams {
 
     /// Force system to keep model in RAM
     pub use_mlock: bool,
+
+    /// Pooling strategy for embedding models
+    pooling_type: EmbeddingModelPoolingType,
 }
 
 /// A policy to split the model across multiple GPUs
@@ -59,6 +62,25 @@ pub enum SplitMode {
     ///
     /// Equivalent to [`llama_split_mode_LLAMA_SPLIT_ROW`]
     Row,
+}
+
+/// Pooling strategy for embedding models
+///
+/// Different models support different pooling strategies:
+/// - BERT models typically use CLS pooling
+/// - Sentence transformers often use Mean pooling
+/// - Some models work best with no pooling
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EmbeddingModelPoolingType {
+    /// Let the model decide (default behavior)
+    Unspecified,
+    /// No pooling - return raw token embeddings
+    None,
+    /// Mean pooling - average all token embeddings
+    Mean,
+    /// CLS pooling - use only the [CLS] token embedding
+    CLS,
 }
 
 impl From<SplitMode> for llama_split_mode {
@@ -83,6 +105,33 @@ impl From<llama_split_mode> for SplitMode {
     }
 }
 
+impl From<EmbeddingModelPoolingType> for llama_pooling_type {
+    fn from(value: EmbeddingModelPoolingType) -> Self {
+        match value {
+            EmbeddingModelPoolingType::Unspecified => {
+                llama_pooling_type::LLAMA_POOLING_TYPE_UNSPECIFIED
+            }
+            EmbeddingModelPoolingType::None => llama_pooling_type::LLAMA_POOLING_TYPE_NONE,
+            EmbeddingModelPoolingType::Mean => llama_pooling_type::LLAMA_POOLING_TYPE_MEAN,
+            EmbeddingModelPoolingType::CLS => llama_pooling_type::LLAMA_POOLING_TYPE_CLS,
+        }
+    }
+}
+
+impl From<llama_pooling_type> for EmbeddingModelPoolingType {
+    fn from(value: llama_pooling_type) -> Self {
+        match value {
+            llama_pooling_type::LLAMA_POOLING_TYPE_UNSPECIFIED => {
+                EmbeddingModelPoolingType::Unspecified
+            }
+            llama_pooling_type::LLAMA_POOLING_TYPE_NONE => EmbeddingModelPoolingType::None,
+            llama_pooling_type::LLAMA_POOLING_TYPE_MEAN => EmbeddingModelPoolingType::Mean,
+            llama_pooling_type::LLAMA_POOLING_TYPE_CLS => EmbeddingModelPoolingType::CLS,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl Default for LlamaParams {
     fn default() -> Self {
         // SAFETY: Stack constructor, always safe
@@ -95,6 +144,7 @@ impl Default for LlamaParams {
             vocab_only: c_params.vocab_only,
             use_mmap: c_params.use_mmap,
             use_mlock: c_params.use_mlock,
+            pooling_type: EmbeddingModelPoolingType::Unspecified,
         }
     }
 }
@@ -123,6 +173,9 @@ pub struct EmbeddingsParams {
 
     /// number of threads to use for batch processing
     pub n_threads_batch: u32,
+
+    /// Type of pooling (if any) to use in embegging
+    pub pooling_type: EmbeddingModelPoolingType,
 }
 
 impl EmbeddingsParams {
@@ -136,18 +189,68 @@ impl EmbeddingsParams {
         ctx_params.n_ctx = batch_capacity as u32;
         ctx_params.n_batch = batch_capacity as u32;
         ctx_params.n_ubatch = batch_capacity as u32;
+        ctx_params.pooling_type = self.pooling_type.into();
 
         ctx_params
+    }
+
+    /// Create a new builder for configuring embedding parameters
+    pub fn builder() -> EmbeddingsParamsBuilder {
+        EmbeddingsParamsBuilder::default()
     }
 }
 
 impl Default for EmbeddingsParams {
     fn default() -> Self {
-        let threads = num_cpus::get_physical() as u32 - 1;
+        Self::builder().build()
+    }
+}
 
+impl EmbeddingsParams {}
+
+/// Builder for configuring embedding parameters
+pub struct EmbeddingsParamsBuilder {
+    n_threads: u32,
+    n_threads_batch: u32,
+    pooling_type: EmbeddingModelPoolingType,
+}
+
+impl Default for EmbeddingsParamsBuilder {
+    fn default() -> Self {
+        let threads = num_cpus::get_physical() as u32 - 1;
         Self {
             n_threads: threads,
             n_threads_batch: threads,
+            pooling_type: EmbeddingModelPoolingType::Unspecified,
+        }
+    }
+}
+
+impl EmbeddingsParamsBuilder {
+    /// Set the number of threads to use for generation
+    pub fn n_threads(mut self, threads: u32) -> Self {
+        self.n_threads = threads;
+        self
+    }
+
+    /// Set the number of threads to use for batch processing
+    pub fn n_threads_batch(mut self, threads: u32) -> Self {
+        self.n_threads_batch = threads;
+        self
+    }
+
+    /// Set the pooling type for embeddings
+    pub fn pooling_type(mut self, pooling: EmbeddingModelPoolingType) -> Self {
+        self.pooling_type = pooling;
+        self
+    }
+
+    /// Build the final EmbeddingsParams
+    pub fn build(self) -> EmbeddingsParams {
+        EmbeddingsParams {
+            n_threads: self.n_threads,
+            n_threads_batch: self.n_threads_batch,
+            pooling_type: self.pooling_type,
         }
     }
 }

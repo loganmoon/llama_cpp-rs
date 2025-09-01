@@ -22,7 +22,7 @@ cc = { version = "1.0.83", features = ["parallel"] }
 once_cell = "1.19.0"
 
 [features]
-default = ["compat", "native"]
+default = ["native"]
 compat = [] # this feature modifies the symbols exposed by the generated libraries to avoid conflicts
 native = ["avx", "avx2", "fma", "f16c", "accel"]
 avx = []

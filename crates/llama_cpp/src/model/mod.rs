@@ -723,6 +723,8 @@ impl LlamaModel {
         let inputs = self.tokenize_slice(inputs, true, false)?;
         let model = self.clone();
 
+        self.
+
         tokio::task::spawn_blocking(move || model.embeddings_process(inputs, params))
             .await
             .unwrap()
