@@ -782,6 +782,9 @@ fn main() {
     compile_ggml_backend(cxx.clone());
     compile_ggml_cpu_backend(cx, cxx.clone(), &out_path);
     compile_llama(cxx, &out_path);
+    
+    // Export the backend path for runtime use
+    println!("cargo:rustc-env=GGML_BACKENDS_BUILD_PATH={}", out_path.display());
 
     #[cfg(all(
         feature = "compat",

@@ -27,3 +27,8 @@ use cudarc;
 extern crate link_cplusplus;
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+/// Get the path to the GGML backend libraries built by this crate
+pub fn get_backends_build_path() -> Option<&'static str> {
+    option_env!("GGML_BACKENDS_BUILD_PATH")
+}

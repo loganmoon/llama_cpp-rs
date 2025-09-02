@@ -37,11 +37,22 @@ impl Backend {
             
             // Load backends - check GGML_BACKENDS_PATH first (for dynamic loading)
             // This is the standard environment variable that llama.cpp uses
-            if let Ok(ggml_path) = std::env::var("GGML_BACKENDS_PATH") {
+            let backend_path = if let Ok(ggml_path) = std::env::var("GGML_BACKENDS_PATH") {
                 eprintln!("[Backend::init] Loading backends from GGML_BACKENDS_PATH: {}", ggml_path);
-                let c_path = std::ffi::CString::new(ggml_path.as_str()).unwrap();
+                Some(ggml_path)
+            } else if let Some(build_path) = llama_cpp_sys::get_backends_build_path() {
+                // Use the path from build time if available
+                eprintln!("[Backend::init] Loading backends from build path: {}", build_path);
+                Some(build_path.to_string())
+            } else {
+                eprintln!("[Backend::init] No backend path found, trying default locations...");
+                None
+            };
+            
+            if let Some(path) = backend_path {
+                let c_path = std::ffi::CString::new(path.as_str()).unwrap();
                 ggml_backend_load_all_from_path(c_path.as_ptr());
-            }  else {
+            } else {
                 // Load all available backends from default locations
                 eprintln!("[Backend::init] Loading all available backends from default locations...");
                 ggml_backend_load_all();

@@ -3,9 +3,9 @@
 //! This crate automatically downloads small test models from Hugging Face for testing.
 //! Models are cached in a temporary directory and reused across test runs.
 
-mod test_models;
+mod test_model_downloader;
 
-use test_models::TestModelGenerator;
+use test_model_downloader::TestModelGenerator;
 use once_cell::sync::Lazy;
 use std::sync::Once;
 
