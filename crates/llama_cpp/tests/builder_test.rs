@@ -1,33 +1,31 @@
 #[cfg(test)]
 mod tests {
-    use llama_cpp::EmbeddingsParams;
+    use llama_cpp::{EmbeddingsParams, EmbeddingModelPoolingType};
 
     #[test]
     fn test_builder_pattern() {
-        // Test factory methods
-        let params = EmbeddingsParams::with_mean_pooling();
-        assert!(params.pooling_type.is_some());
+        // Test builder with mean pooling
+        let params = EmbeddingsParams::builder()
+            .pooling_type(EmbeddingModelPoolingType::Mean)
+            .build();
+        assert_eq!(params.pooling_type, EmbeddingModelPoolingType::Mean);
 
-        // Test builder with pooling
-        let params = EmbeddingsParams::builder().with_mean_pooling().build();
-        assert!(params.pooling_type.is_some());
-
-        // Test builder with threads configuration
+        // Test builder with threads configuration and CLS pooling
         let params = EmbeddingsParams::builder()
             .n_threads(8)
             .n_threads_batch(4)
-            .with_cls_pooling()
+            .pooling_type(EmbeddingModelPoolingType::CLS)
             .build();
         assert_eq!(params.n_threads, 8);
         assert_eq!(params.n_threads_batch, 4);
-        assert!(params.pooling_type.is_some());
+        assert_eq!(params.pooling_type, EmbeddingModelPoolingType::CLS);
 
         // Test chaining overwrites previous pooling
         let params = EmbeddingsParams::builder()
-            .with_cls_pooling()
-            .with_mean_pooling()
+            .pooling_type(EmbeddingModelPoolingType::CLS)
+            .pooling_type(EmbeddingModelPoolingType::Mean)
             .build();
-        assert!(params.pooling_type.is_some());
+        assert_eq!(params.pooling_type, EmbeddingModelPoolingType::Mean);
     }
 
     #[test]
@@ -35,6 +33,6 @@ mod tests {
         let params = EmbeddingsParams::builder().build();
         assert!(params.n_threads > 0);
         assert!(params.n_threads_batch > 0);
-        assert_eq!(params.pooling_type, None);
+        assert_eq!(params.pooling_type, EmbeddingModelPoolingType::Unspecified);
     }
 }

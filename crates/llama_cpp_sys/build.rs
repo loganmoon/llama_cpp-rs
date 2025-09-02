@@ -95,6 +95,8 @@ fn compile_bindings(out_path: &Path) {
     println!("Generating bindings..");
     let mut bindings = bindgen::Builder::default()
         .header(LLAMA_PATH.join("ggml/include/ggml.h").to_string_lossy())
+        .header(LLAMA_PATH.join("ggml/include/ggml-backend.h").to_string_lossy())
+        .header(LLAMA_PATH.join("ggml/include/ggml-cpu.h").to_string_lossy())
         .header(LLAMA_PATH.join("include/llama.h").to_string_lossy())
         .clang_arg(format!("-I{}", LLAMA_PATH.join("ggml/include").display()))
         .clang_arg(format!("-I{}", LLAMA_PATH.join("include").display()))
@@ -333,50 +335,6 @@ fn push_feature_flags(cx: &mut Build, cxx: &mut Build) {
     }
 }
 
-fn compile_opencl(cx: &mut Build, cxx: &mut Build) {
-    println!("Compiling OpenCL GGML..");
-
-    // TODO
-    println!("cargo:warning=OpenCL compilation and execution has not been properly tested yet");
-
-    cx.define("GGML_USE_CLBLAST", None);
-    cxx.define("GGML_USE_CLBLAST", None);
-
-    if cfg!(target_os = "linux") {
-        println!("cargo:rustc-link-lib=OpenCL");
-        println!("cargo:rustc-link-lib=clblast");
-    } else if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=framework=OpenCL");
-        println!("cargo:rustc-link-lib=clblast");
-    }
-
-    cxx.file(LLAMA_PATH.join("ggml/src/ggml-opencl.cpp"));
-}
-
-fn compile_openblas(cx: &mut Build) {
-    println!("Compiling OpenBLAS GGML..");
-
-    // TODO
-    println!("cargo:warning=OpenBlas compilation and execution has not been properly tested yet");
-
-    cx.define("GGML_USE_OPENBLAS", None)
-        .include("/usr/local/include/openblas")
-        .include("/usr/local/include/openblas");
-    println!("cargo:rustc-link-lib=openblas");
-}
-
-fn compile_blis(cx: &mut Build) {
-    println!("Compiling BLIS GGML..");
-
-    // TODO
-    println!("cargo:warning=Blis compilation and execution has not been properly tested yet");
-
-    cx.define("GGML_USE_OPENBLAS", None)
-        .include("/usr/local/include/blis")
-        .include("/usr/local/include/blis");
-    println!("cargo:rustc-link-search=native=/usr/local/lib");
-    println!("cargo:rustc-link-lib=blis");
-}
 
 fn compile_hipblas(cx: &mut Build, cxx: &mut Build, mut hip: Build) -> &'static str {
     const DEFAULT_ROCM_PATH_STR: &str = "/opt/rocm/";
@@ -630,7 +588,37 @@ fn compile_ggml_backend(mut cxx: Build) {
         .file(LLAMA_PATH.join("ggml/src/ggml-backend-reg.cpp"))
         .file(LLAMA_PATH.join("ggml/src/gguf.cpp"))
         .file(LLAMA_PATH.join("ggml/src/ggml-opt.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-threading.cpp"))
         .compile("ggml_backend");
+}
+
+fn compile_ggml_cpu_backend(mut cx: Build, mut cxx: Build) {
+    println!("Compiling GGML CPU Backend..");
+    
+    // Compile C files
+    cx.include(LLAMA_PATH.join("ggml/include").as_path())
+        .include(LLAMA_PATH.join("ggml/src").as_path())
+        .include(LLAMA_PATH.join("ggml/src/ggml-cpu").as_path())
+        .define("GGML_BACKEND_DL", None)
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/ggml-cpu.c"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/quants.c"))
+        .compile("ggml_cpu_c");
+    
+    // Compile C++ files
+    cxx.std("c++17")
+        .include(LLAMA_PATH.join("ggml/include").as_path())
+        .include(LLAMA_PATH.join("ggml/src").as_path())
+        .include(LLAMA_PATH.join("ggml/src/ggml-cpu").as_path())
+        .define("GGML_BACKEND_DL", None)
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/ggml-cpu.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/repack.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/hbm.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/traits.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/binary-ops.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/unary-ops.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/vec.cpp"))
+        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/ops.cpp"))
+        .compile("ggml_cpu");
 }
 
 fn compile_llama(mut cxx: Build, _out_path: impl AsRef<Path>) {
@@ -706,15 +694,6 @@ fn main() {
         Some(compile_vulkan(&mut cx, &mut cxx))
     } else if cfg!(feature = "cuda") {
         Some(compile_cuda(&mut cx, &mut cxx, featless_cxx))
-    } else if cfg!(feature = "opencl") {
-        compile_opencl(&mut cx, &mut cxx);
-        None
-    } else if cfg!(feature = "openblas") {
-        compile_openblas(&mut cx);
-        None
-    } else if cfg!(feature = "blis") {
-        compile_blis(&mut cx);
-        None
     } else if cfg!(feature = "metal") && cfg!(target_os = "macos") {
         compile_metal(&mut cx, &mut cxx);
         None
@@ -724,8 +703,9 @@ fn main() {
         None
     };
 
-    compile_ggml(cx);
+    compile_ggml(cx.clone());
     compile_ggml_backend(cxx.clone());
+    compile_ggml_cpu_backend(cx, cxx.clone());
     compile_llama(cxx, &out_path);
 
     #[cfg(all(

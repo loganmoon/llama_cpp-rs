@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use tracing::error;
 
 use llama_cpp_sys::{
-    ggml_numa_strategy, llama_backend_free, llama_backend_init, llama_log_set, llama_numa_init,
+    ggml_backend_load_all, ggml_numa_strategy, llama_backend_free, llama_backend_init, 
+    llama_log_set, llama_numa_init,
 };
 
 use crate::detail;
@@ -32,6 +33,9 @@ impl Backend {
         unsafe {
             // SAFETY: This is only called when no models or sessions exist.
             llama_backend_init();
+            
+            // Load all available backends - required for new llama.cpp versions
+            ggml_backend_load_all();
 
             // TODO look into numa strategies, this should probably be part of the API
             llama_numa_init(ggml_numa_strategy::GGML_NUMA_STRATEGY_DISTRIBUTE);
