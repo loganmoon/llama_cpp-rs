@@ -708,10 +708,10 @@ impl LlamaModel {
                 out.append(&mut self.embeddings_decode(
                     context,
                     &batch,
-                    &token_counts[submitted..batch_input_count],
+                    &token_counts[submitted..submitted + batch_input_count],
                 )?);
                 batch.clear();
-                submitted = batch_input_count;
+                submitted = submitted + batch_input_count;
                 batch_input_count = 0;
             }
 
@@ -728,7 +728,7 @@ impl LlamaModel {
             out.append(&mut self.embeddings_decode(
                 context,
                 &batch,
-                &token_counts[submitted..batch_input_count],
+                &token_counts[submitted..submitted + batch_input_count],
             )?);
         }
 
