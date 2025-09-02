@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use tracing::error;
 
 use llama_cpp_sys::{
-    ggml_backend_load_all, ggml_numa_strategy, llama_backend_free, llama_backend_init, 
-    llama_log_set, llama_numa_init,
+    ggml_backend_load_all, ggml_backend_load_all_from_path, ggml_numa_strategy, 
+    llama_backend_free, llama_backend_init, llama_log_set, llama_numa_init,
 };
 
 use crate::detail;
@@ -32,10 +32,26 @@ impl Backend {
     fn init() -> Self {
         unsafe {
             // SAFETY: This is only called when no models or sessions exist.
+            eprintln!("[Backend::init] Initializing llama backend...");
             llama_backend_init();
             
-            // Load all available backends - required for new llama.cpp versions
-            ggml_backend_load_all();
+            // Load backends - check GGML_BACKENDS_PATH first (for dynamic loading)
+            // This is the standard environment variable that llama.cpp uses
+            if let Ok(ggml_path) = std::env::var("GGML_BACKENDS_PATH") {
+                eprintln!("[Backend::init] Loading backends from GGML_BACKENDS_PATH: {}", ggml_path);
+                let c_path = std::ffi::CString::new(ggml_path.as_str()).unwrap();
+                ggml_backend_load_all_from_path(c_path.as_ptr());
+            }  else {
+                // Load all available backends from default locations
+                eprintln!("[Backend::init] Loading all available backends from default locations...");
+                ggml_backend_load_all();
+            }
+            
+            // Check how many backends were loaded
+            let backend_count = llama_cpp_sys::ggml_backend_reg_count();
+            let device_count = llama_cpp_sys::ggml_backend_dev_count();
+            eprintln!("[Backend::init] Backends registered: {}", backend_count);
+            eprintln!("[Backend::init] Devices available: {}", device_count);
 
             // TODO look into numa strategies, this should probably be part of the API
             llama_numa_init(ggml_numa_strategy::GGML_NUMA_STRATEGY_DISTRIBUTE);

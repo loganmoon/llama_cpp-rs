@@ -1,7 +1,27 @@
 //! Test harness for [`llama_cpp`][lcpp] and [`llama_cpp_sys`].
 //!
-//! This crate expects one or more `llama.cpp`-compatible GGUF models to be made available in
-//! a directory specified in the `LLAMA_CPP_TEST_MODELS` environment variable.
+//! This crate automatically downloads small test models from Hugging Face for testing.
+//! Models are cached in a temporary directory and reused across test runs.
+
+mod test_models;
+
+use test_models::TestModelGenerator;
+use once_cell::sync::Lazy;
+use std::sync::Once;
+
+static INIT: Once = Once::new();
+
+fn ensure_test_models() {
+    INIT.call_once(|| {
+        println!("Setting up test models...");
+        // Simply set environment variables to point to existing models
+        // The embedding model should already be downloaded at /tmp/llama_cpp_test_models
+        let models_dir = "/tmp/llama_cpp_test_models";
+        std::env::set_var("LLAMA_CPP_TEST_MODELS", models_dir);
+        std::env::set_var("LLAMA_EMBED_MODELS_DIR", models_dir);
+        println!("Test models directory set to: {}", models_dir);
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -21,6 +41,8 @@ mod tests {
     use llama_cpp::{
         CompletionHandle, EmbeddingsParams, LlamaModel, LlamaParams, SessionParams, TokensToStrings,
     };
+    
+    use crate::ensure_test_models;
 
     fn init_tracing() {
         static SUBSCRIBER_SET: AtomicBool = AtomicBool::new(false);
@@ -64,15 +86,12 @@ mod tests {
     }
 
     // TODO theres a concurrency issue with vulkan, look into it
-    #[ignore]
     #[tokio::test]
     async fn load_models() {
-        let dir = std::env::var("LLAMA_CPP_TEST_MODELS").unwrap_or_else(|_| {
-            panic!(
-                "LLAMA_CPP_TEST_MODELS environment variable not set. \
-                Please set this to the directory containing one or more GGUF models."
-            );
-        });
+        ensure_test_models();
+        
+        let dir = std::env::var("LLAMA_CPP_TEST_MODELS")
+            .expect("LLAMA_CPP_TEST_MODELS should be set by test setup");
 
         let models = list_models(dir).await;
 
@@ -87,13 +106,10 @@ mod tests {
     #[tokio::test]
     async fn execute_completions() {
         init_tracing();
+        ensure_test_models();
 
-        let dir = std::env::var("LLAMA_CPP_TEST_MODELS").unwrap_or_else(|_| {
-            panic!(
-                "LLAMA_CPP_TEST_MODELS environment variable not set. \
-                Please set this to the directory containing one or more GGUF models."
-            );
-        });
+        let dir = std::env::var("LLAMA_CPP_TEST_MODELS")
+            .expect("LLAMA_CPP_TEST_MODELS should be set by test setup");
 
         let models = list_models(dir).await;
 
@@ -174,13 +190,10 @@ mod tests {
     #[tokio::test]
     async fn embed() {
         init_tracing();
+        ensure_test_models();
 
-        let dir = std::env::var("LLAMA_EMBED_MODELS_DIR").unwrap_or_else(|_| {
-            panic!(
-                "LLAMA_EMBED_MODELS_DIR environment variable not set. \
-                Please set this to the directory containing one or more embedding GGUF models."
-            );
-        });
+        let dir = std::env::var("LLAMA_EMBED_MODELS_DIR")
+            .expect("LLAMA_EMBED_MODELS_DIR should be set by test setup");
 
         let models = list_models(dir).await;
 

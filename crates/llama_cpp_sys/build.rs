@@ -592,33 +592,108 @@ fn compile_ggml_backend(mut cxx: Build) {
         .compile("ggml_backend");
 }
 
-fn compile_ggml_cpu_backend(mut cx: Build, mut cxx: Build) {
-    println!("Compiling GGML CPU Backend..");
+fn compile_ggml_cpu_backend(_cx: Build, _cxx: Build, out_path: &Path) {
+    println!("Compiling GGML CPU Backend as shared library..");
     
-    // Compile C files
-    cx.include(LLAMA_PATH.join("ggml/include").as_path())
-        .include(LLAMA_PATH.join("ggml/src").as_path())
-        .include(LLAMA_PATH.join("ggml/src/ggml-cpu").as_path())
-        .define("GGML_BACKEND_DL", None)
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/ggml-cpu.c"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/quants.c"))
-        .compile("ggml_cpu_c");
+    // First compile C files to object files
+    let c_objects = vec![
+        ("ggml.o", LLAMA_PATH.join("ggml/src/ggml.c")),
+        ("ggml-alloc.o", LLAMA_PATH.join("ggml/src/ggml-alloc.c")),
+        ("ggml-quants.o", LLAMA_PATH.join("ggml/src/ggml-quants.c")),
+        ("ggml-cpu-c.o", LLAMA_PATH.join("ggml/src/ggml-cpu/ggml-cpu.c")),
+        ("quants.o", LLAMA_PATH.join("ggml/src/ggml-cpu/quants.c")),
+        ("quants-x86.o", LLAMA_PATH.join("ggml/src/ggml-cpu/arch/x86/quants.c")),
+    ];
     
-    // Compile C++ files
-    cxx.std("c++17")
-        .include(LLAMA_PATH.join("ggml/include").as_path())
-        .include(LLAMA_PATH.join("ggml/src").as_path())
-        .include(LLAMA_PATH.join("ggml/src/ggml-cpu").as_path())
-        .define("GGML_BACKEND_DL", None)
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/ggml-cpu.cpp"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/repack.cpp"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/hbm.cpp"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/traits.cpp"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/binary-ops.cpp"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/unary-ops.cpp"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/vec.cpp"))
-        .file(LLAMA_PATH.join("ggml/src/ggml-cpu/ops.cpp"))
-        .compile("ggml_cpu");
+    for (obj_name, src_file) in &c_objects {
+        let mut cmd = std::process::Command::new("cc");
+        cmd.arg("-c")
+            .arg("-fPIC")
+            .arg("-O3")
+            .arg("-D_GNU_SOURCE")  // For GNU/Linux features
+            .arg("-DGGML_VERSION=\"0.0.0\"")
+            .arg("-DGGML_COMMIT=\"unknown\"")
+            .arg("-DGGML_BACKEND_DL")
+            .arg("-DGGML_BACKEND_BUILD")
+            .arg("-DGGML_BACKEND_SHARED")
+            .arg(format!("-I{}", LLAMA_PATH.join("ggml/include").display()))
+            .arg(format!("-I{}", LLAMA_PATH.join("ggml/src").display()))
+            .arg(format!("-I{}", LLAMA_PATH.join("ggml/src/ggml-cpu").display()))
+            .arg("-o")
+            .arg(out_path.join(obj_name))
+            .arg(src_file);
+        
+        let output = cmd.output().expect("Failed to compile C file");
+        if !output.status.success() {
+            eprintln!("Failed to compile {}: {}", obj_name, String::from_utf8_lossy(&output.stderr));
+            panic!("C compilation failed");
+        }
+    }
+    
+    // Then compile C++ files to object files
+    let cpp_objects = vec![
+        ("ggml-backend.o", LLAMA_PATH.join("ggml/src/ggml-backend.cpp")),
+        ("ggml-backend-reg.o", LLAMA_PATH.join("ggml/src/ggml-backend-reg.cpp")),
+        ("ggml-opt.o", LLAMA_PATH.join("ggml/src/ggml-opt.cpp")),
+        ("ggml-threading.o", LLAMA_PATH.join("ggml/src/ggml-threading.cpp")),
+        ("gguf.o", LLAMA_PATH.join("ggml/src/gguf.cpp")),
+        ("ggml-cpu-cpp.o", LLAMA_PATH.join("ggml/src/ggml-cpu/ggml-cpu.cpp")),
+        ("repack.o", LLAMA_PATH.join("ggml/src/ggml-cpu/repack.cpp")),
+        ("hbm.o", LLAMA_PATH.join("ggml/src/ggml-cpu/hbm.cpp")),
+        ("traits.o", LLAMA_PATH.join("ggml/src/ggml-cpu/traits.cpp")),
+        ("binary-ops.o", LLAMA_PATH.join("ggml/src/ggml-cpu/binary-ops.cpp")),
+        ("unary-ops.o", LLAMA_PATH.join("ggml/src/ggml-cpu/unary-ops.cpp")),
+        ("vec.o", LLAMA_PATH.join("ggml/src/ggml-cpu/vec.cpp")),
+        ("ops.o", LLAMA_PATH.join("ggml/src/ggml-cpu/ops.cpp")),
+        ("cpu-feats-x86.o", LLAMA_PATH.join("ggml/src/ggml-cpu/arch/x86/cpu-feats.cpp")),
+        ("repack-x86.o", LLAMA_PATH.join("ggml/src/ggml-cpu/arch/x86/repack.cpp")),
+    ];
+    
+    for (obj_name, src_file) in &cpp_objects {
+        let mut cmd = std::process::Command::new("c++");
+        cmd.arg("-c")
+            .arg("-fPIC")
+            .arg("-std=c++17")
+            .arg("-O3")
+            .arg("-D_GNU_SOURCE")  // For GNU/Linux features
+            .arg("-DGGML_VERSION=\"0.0.0\"")
+            .arg("-DGGML_COMMIT=\"unknown\"")
+            .arg("-DGGML_BACKEND_DL")
+            .arg("-DGGML_BACKEND_BUILD")
+            .arg("-DGGML_BACKEND_SHARED")
+            .arg(format!("-I{}", LLAMA_PATH.join("ggml/include").display()))
+            .arg(format!("-I{}", LLAMA_PATH.join("ggml/src").display()))
+            .arg(format!("-I{}", LLAMA_PATH.join("ggml/src/ggml-cpu").display()))
+            .arg("-o")
+            .arg(out_path.join(obj_name))
+            .arg(src_file);
+        
+        let output = cmd.output().expect("Failed to compile C++ file");
+        if !output.status.success() {
+            eprintln!("Failed to compile {}: {}", obj_name, String::from_utf8_lossy(&output.stderr));
+            panic!("C++ compilation failed");
+        }
+    }
+    
+    // Link all object files into a shared library
+    let mut cmd = std::process::Command::new("c++");
+    cmd.arg("-shared")
+        .arg("-o")
+        .arg(out_path.join("libggml-cpu-default.so"));
+    
+    // Add all object files
+    for (obj_name, _) in c_objects.iter().chain(cpp_objects.iter()) {
+        cmd.arg(out_path.join(obj_name));
+    }
+    
+    let output = cmd.output().expect("Failed to link shared library");
+    if !output.status.success() {
+        eprintln!("Linking failed!");
+        eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        panic!("Failed to link libggml-cpu-default.so");
+    }
+    
+    println!("Created libggml-cpu-default.so at {}", out_path.join("libggml-cpu-default.so").display());
 }
 
 fn compile_llama(mut cxx: Build, _out_path: impl AsRef<Path>) {
@@ -705,7 +780,7 @@ fn main() {
 
     compile_ggml(cx.clone());
     compile_ggml_backend(cxx.clone());
-    compile_ggml_cpu_backend(cx, cxx.clone());
+    compile_ggml_cpu_backend(cx, cxx.clone(), &out_path);
     compile_llama(cxx, &out_path);
 
     #[cfg(all(
