@@ -810,11 +810,30 @@ impl LlamaModel {
         // Process non-empty inputs
         if !non_empty_inputs.is_empty() {
             let tokenized = self.tokenize_slice(&non_empty_inputs, true, false)?;
-            let embeddings = self.embeddings_process(tokenized, params)?;
             
-            // Place results in correct positions
-            for (i, idx) in non_empty_indices.iter().enumerate() {
-                results[*idx] = Some(embeddings[i].clone());
+            // Filter out inputs that tokenized to zero tokens
+            let mut valid_tokenized = Vec::new();
+            let mut valid_indices = Vec::new();
+            
+            for (i, tokens) in tokenized.iter().enumerate() {
+                if !tokens.is_empty() {
+                    valid_tokenized.push(tokens.clone());
+                    valid_indices.push(non_empty_indices[i]);
+                } else {
+                    // Provide default zero embedding for inputs that tokenized to zero tokens
+                    trace!("Input {} tokenized to zero tokens, providing zero embedding", non_empty_indices[i]);
+                    results[non_empty_indices[i]] = Some(vec![0.0f32; self.embedding_length]);
+                }
+            }
+            
+            // Only process if we have valid tokenized inputs
+            if !valid_tokenized.is_empty() {
+                let embeddings = self.embeddings_process(valid_tokenized, params)?;
+                
+                // Place results in correct positions
+                for (i, idx) in valid_indices.iter().enumerate() {
+                    results[*idx] = Some(embeddings[i].clone());
+                }
             }
         }
         
