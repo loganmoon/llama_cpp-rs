@@ -603,6 +603,11 @@ impl LlamaModel {
         batch: &Batch,
         token_counts: &[usize],
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        // Don't process if batch is empty
+        if batch.tokens() == 0 {
+            return Ok(Vec::new());
+        }
+        
         let res = unsafe {
             // clear previous kv_cache values (irrelevant for embeddings)
             let memory = llama_get_memory(context);
@@ -617,11 +622,16 @@ impl LlamaModel {
         let mut out = Vec::with_capacity(token_counts.len());
 
         for (i, count) in token_counts.iter().enumerate() {
+            // Skip if no tokens for this input
+            if *count == 0 {
+                continue;
+            }
+            
             let embedding = unsafe {
                 let mut ptr = llama_get_embeddings_seq(context, i as i32);
 
-                if ptr.is_null() {
-                    ptr = llama_get_embeddings_ith(context, (count - 1) as i32);
+                if ptr.is_null() && *count > 0 {
+                    ptr = llama_get_embeddings_ith(context, (*count as i32) - 1);
                 }
 
                 if ptr.is_null() {
@@ -668,6 +678,11 @@ impl LlamaModel {
         inputs: Vec<Vec<Token>>,
         params: EmbeddingsParams,
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        // Handle empty input gracefully
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        
         let mut total_tokens = 0;
         let mut max_tokens = 0;
         let token_counts: Vec<usize> = inputs.iter().map(|v| v.len()).collect();
@@ -678,14 +693,18 @@ impl LlamaModel {
             }
         }
 
+        // If all inputs are empty, return zero embeddings for each
+        if total_tokens == 0 {
+            return Ok(vec![vec![0.0f32; self.embedding_length]; inputs.len()]);
+        }
+
         let batch_capacity = if max_tokens > self.training_size {
             warn!("Large embedding input requires a context larger than the model's training context.");
             max_tokens
         } else {
             min(self.training_size, total_tokens)
         };
-        let mut batch = Batch::new(batch_capacity, 0, 1);
-        let mut out = Vec::with_capacity(inputs.len());
+        let mut batch = Batch::new(batch_capacity, self.embedding_length, 1);
 
         let context_params = params.as_context_params(batch_capacity);
         let context = unsafe {
@@ -700,38 +719,70 @@ impl LlamaModel {
             return Err(LlamaContextError::SessionFailed);
         }
 
-        let mut batch_input_count = 0;
-        let mut submitted = 0;
-        for input in inputs {
+        // Process inputs, keeping track of which ones are empty
+        let mut result_embeddings = vec![None; inputs.len()];
+        let mut batch_indices = Vec::new();
+        let mut batch_token_counts = Vec::new();
+        
+        for (idx, input) in inputs.iter().enumerate() {
+            if input.is_empty() {
+                // For empty inputs, directly set a zero embedding
+                result_embeddings[idx] = Some(vec![0.0f32; self.embedding_length]);
+                continue;
+            }
+            
+            // Check if adding this input would exceed batch capacity
             if batch.tokens() + input.len() > batch_capacity {
-                trace!("Decoding {} embedding tokens", batch.tokens());
-                out.append(&mut self.embeddings_decode(
-                    context,
-                    &batch,
-                    &token_counts[submitted..submitted + batch_input_count],
-                )?);
-                batch.clear();
-                submitted = submitted + batch_input_count;
-                batch_input_count = 0;
+                // Process current batch
+                if !batch_indices.is_empty() {
+                    trace!("Decoding {} embedding tokens", batch.tokens());
+                    let decoded = self.embeddings_decode(
+                        context,
+                        &batch,
+                        &batch_token_counts,
+                    )?;
+                    
+                    // Store results in correct positions
+                    for (i, &idx) in batch_indices.iter().enumerate() {
+                        result_embeddings[idx] = Some(decoded[i].clone());
+                    }
+                    
+                    batch.clear();
+                    batch_indices.clear();
+                    batch_token_counts.clear();
+                }
             }
-
-            trace!("Adding {} tokens to batch", input.len());
+            
+            // Add tokens to batch
+            trace!("Adding {} tokens to batch for input {}", input.len(), idx);
             for (i, token) in input.iter().enumerate() {
-                batch.add(*token, i, &[batch_input_count as i32], false);
+                let is_last = i == input.len() - 1;
+                batch.add(*token, i, &[batch_indices.len() as i32], is_last);
             }
-            batch.set_logits(batch.tokens() - 1, true);
-            batch_input_count += 1;
+            batch_indices.push(idx);
+            batch_token_counts.push(input.len());
         }
-
-        if 0 < batch_input_count {
+        
+        // Process any remaining batch
+        if !batch_indices.is_empty() {
             trace!("Decoding remaining {} embedding tokens", batch.tokens());
-            out.append(&mut self.embeddings_decode(
+            let decoded = self.embeddings_decode(
                 context,
                 &batch,
-                &token_counts[submitted..submitted + batch_input_count],
-            )?);
+                &batch_token_counts,
+            )?;
+            
+            // Store results in correct positions
+            for (i, &idx) in batch_indices.iter().enumerate() {
+                result_embeddings[idx] = Some(decoded[i].clone());
+            }
         }
-
+        
+        // Convert Option<Vec<f32>> to Vec<Vec<f32>>
+        let out = result_embeddings.into_iter()
+            .map(|opt| opt.expect("All embeddings should be set"))
+            .collect();
+        
         Ok(out)
     }
 
@@ -741,8 +792,34 @@ impl LlamaModel {
         inputs: &[impl AsRef<[u8]>],
         params: EmbeddingsParams,
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
-        let inputs = self.tokenize_slice(inputs, true, false)?;
-        self.embeddings_process(inputs, params)
+        // Return zero embeddings for empty strings without tokenizing
+        let mut results = Vec::with_capacity(inputs.len());
+        let mut non_empty_indices = Vec::new();
+        let mut non_empty_inputs = Vec::new();
+        
+        for (idx, input) in inputs.iter().enumerate() {
+            if input.as_ref().is_empty() {
+                results.push(Some(vec![0.0f32; self.embedding_length]));
+            } else {
+                results.push(None);
+                non_empty_indices.push(idx);
+                non_empty_inputs.push(input.as_ref());
+            }
+        }
+        
+        // Process non-empty inputs
+        if !non_empty_inputs.is_empty() {
+            let tokenized = self.tokenize_slice(&non_empty_inputs, true, false)?;
+            let embeddings = self.embeddings_process(tokenized, params)?;
+            
+            // Place results in correct positions
+            for (i, idx) in non_empty_indices.iter().enumerate() {
+                results[*idx] = Some(embeddings[i].clone());
+            }
+        }
+        
+        // Convert Option<Vec<f32>> to Vec<Vec<f32>>
+        Ok(results.into_iter().map(|opt| opt.unwrap()).collect())
     }
 
     /// Runs embeddings inference for the given inputs, returning the result.
@@ -754,10 +831,15 @@ impl LlamaModel {
         inputs: &[impl AsRef<[u8]>],
         params: EmbeddingsParams,
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
-        let inputs = self.tokenize_slice(inputs, true, false)?;
+        // Convert inputs to Vec<Vec<u8>> to make them owned and Send
+        let inputs: Vec<Vec<u8>> = inputs.iter().map(|i| i.as_ref().to_vec()).collect();
         let model = self.clone();
 
-        tokio::task::spawn_blocking(move || model.embeddings_process(inputs, params))
+        tokio::task::spawn_blocking(move || {
+            // Convert back to references for the embeddings call
+            let input_refs: Vec<&[u8]> = inputs.iter().map(|v| v.as_slice()).collect();
+            model.embeddings(&input_refs, params)
+        })
             .await
             .unwrap()
     }

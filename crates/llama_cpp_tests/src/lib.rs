@@ -3,7 +3,8 @@
 //! This crate automatically downloads small test models from Hugging Face for testing.
 //! Models are cached in a temporary directory and reused across test runs.
 
-mod test_model_downloader;
+pub mod test_model_downloader;
+pub mod embeddings_edge_cases;
 
 use test_model_downloader::TestModelGenerator;
 use once_cell::sync::Lazy;
@@ -246,6 +247,201 @@ mod tests {
                 let mag = sum.sqrt();
                 assert!(mag < 1. + ERROR, "Vector magnitude is not close to 1");
                 assert!(mag > 1. - ERROR, "Vector magnitude is not close to 1");
+            }
+        }
+    }
+
+    async fn run_embeddings_edge_case_test(
+        model: &LlamaModel,
+        input: Vec<String>,
+        test_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!("  Running embeddings for: {}", test_name);
+        println!("  Input count: {}, Total chars: {}", 
+                 input.len(), 
+                 input.iter().map(|s| s.len()).sum::<usize>());
+        
+        let params = EmbeddingsParams::default();
+        
+        match model.embeddings_async(&input, params).await {
+            Ok(embeddings) => {
+                println!("  Result: {} embeddings generated", embeddings.len());
+                
+                // Validate embeddings
+                for (idx, embedding) in embeddings.iter().enumerate() {
+                    if embedding.is_empty() {
+                        return Err(format!("Embedding {} is empty", idx).into());
+                    }
+                    
+                    let mut sum = 0f32;
+                    for value in embedding {
+                        if !value.is_finite() {
+                            return Err(format!("Embedding {} contains non-finite value", idx).into());
+                        }
+                        if *value < -10.0 || *value > 10.0 {
+                            return Err(format!("Embedding {} value {} out of reasonable range", idx, value).into());
+                        }
+                        sum += value * value;
+                    }
+                    
+                    // Check magnitude is reasonable (not necessarily normalized to 1)
+                    let mag = sum.sqrt();
+                    if mag < 0.01 {
+                        return Err(format!("Embedding {} has near-zero magnitude: {}", idx, mag).into());
+                    }
+                    if mag > 100.0 {
+                        return Err(format!("Embedding {} has excessive magnitude: {}", idx, mag).into());
+                    }
+                }
+                
+                Ok(())
+            }
+            Err(e) => {
+                println!("  Result: FAILED - {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_edge_cases() {
+        init_tracing();
+        ensure_test_models();
+        
+        let dir = std::env::var("LLAMA_EMBED_MODELS_DIR")
+            .expect("LLAMA_EMBED_MODELS_DIR should be set by test setup");
+        
+        let models = list_models(dir).await;
+        
+        for model_path in models {
+            println!("\n=== Testing edge cases for model: {:?} ===", model_path);
+            
+            let params = LlamaParams::default();
+            let model = LlamaModel::load_from_file_async(model_path, params)
+                .await
+                .expect("Failed to load model");
+            
+            let mut test_results = Vec::new();
+            
+            // Test 1: Empty input array
+            println!("\nTest 1: Empty input array");
+            let empty_input: Vec<String> = vec![];
+            let result = run_embeddings_edge_case_test(&model, empty_input, "empty_array").await;
+            test_results.push(("empty_array", result));
+            
+            // Test 2: Array with single empty string
+            println!("\nTest 2: Single empty string");
+            let single_empty = vec![String::new()];
+            let result = run_embeddings_edge_case_test(&model, single_empty, "single_empty_string").await;
+            test_results.push(("single_empty_string", result));
+            
+            // Test 3: Array with multiple empty strings
+            println!("\nTest 3: Multiple empty strings");
+            let multiple_empty = vec![String::new(), String::new(), String::new()];
+            let result = run_embeddings_edge_case_test(&model, multiple_empty, "multiple_empty_strings").await;
+            test_results.push(("multiple_empty_strings", result));
+            
+            // Test 4: Mixed empty and non-empty strings
+            println!("\nTest 4: Mixed empty and non-empty strings");
+            let mixed = vec![
+                String::from("Hello"),
+                String::new(),
+                String::from("World"),
+                String::new(),
+            ];
+            let result = run_embeddings_edge_case_test(&model, mixed, "mixed_empty_nonempty").await;
+            test_results.push(("mixed_empty_nonempty", result));
+            
+            // Test 5: Single word
+            println!("\nTest 5: Single word");
+            let single_word = vec![String::from("Hello")];
+            let result = run_embeddings_edge_case_test(&model, single_word, "single_word").await;
+            test_results.push(("single_word", result));
+            
+            // Test 6: Small batch (10 words)
+            println!("\nTest 6: Small batch");
+            let small_batch = vec![String::from("This is a small test batch with ten words total")];
+            let result = run_embeddings_edge_case_test(&model, small_batch, "small_batch").await;
+            test_results.push(("small_batch", result));
+            
+            // Test 7: Medium batch (100 words)
+            println!("\nTest 7: Medium batch");
+            let mut medium_text = String::new();
+            for i in 0..100 {
+                medium_text.push_str(&format!("word{} ", i));
+            }
+            let medium_batch = vec![medium_text];
+            let result = run_embeddings_edge_case_test(&model, medium_batch, "medium_batch").await;
+            test_results.push(("medium_batch", result));
+            
+            // Test 8: Large batch (1000 words)
+            println!("\nTest 8: Large batch");
+            let mut large_text = String::new();
+            for i in 0..1000 {
+                large_text.push_str(&format!("word{} ", i));
+            }
+            let large_batch = vec![large_text];
+            let result = run_embeddings_edge_case_test(&model, large_batch, "large_batch").await;
+            test_results.push(("large_batch", result));
+            
+            // Test 9: Very large batch (original test case - 10x200 words)
+            println!("\nTest 9: Very large batch (original test)");
+            let mut very_large = vec![];
+            for _phrase_idx in 0..10 {
+                let mut phrase = String::new();
+                for _word_idx in 0..200 {
+                    phrase.push_str("word ");
+                }
+                phrase.truncate(phrase.len() - 1);
+                very_large.push(phrase);
+            }
+            let result = run_embeddings_edge_case_test(&model, very_large, "very_large_batch").await;
+            test_results.push(("very_large_batch", result));
+            
+            // Test 10: Special characters
+            println!("\nTest 10: Special characters");
+            let special_chars = vec![
+                String::from("Hello! @#$%^&*()"),
+                String::from("😀 emoji test 🎉"),
+                String::from("\n\t\r"),
+            ];
+            let result = run_embeddings_edge_case_test(&model, special_chars, "special_chars").await;
+            test_results.push(("special_chars", result));
+            
+            // Test 11: Single space
+            println!("\nTest 11: Single space");
+            let single_space = vec![String::from(" ")];
+            let result = run_embeddings_edge_case_test(&model, single_space, "single_space").await;
+            test_results.push(("single_space", result));
+            
+            // Test 12: Multiple spaces
+            println!("\nTest 12: Multiple spaces");
+            let multiple_spaces = vec![String::from("     ")];
+            let result = run_embeddings_edge_case_test(&model, multiple_spaces, "multiple_spaces").await;
+            test_results.push(("multiple_spaces", result));
+            
+            // Print summary
+            println!("\n=== Test Results Summary ===");
+            let mut passed = 0;
+            let mut failed = 0;
+            
+            for (name, result) in &test_results {
+                match result {
+                    Ok(_) => {
+                        println!("✓ {}: PASSED", name);
+                        passed += 1;
+                    }
+                    Err(e) => {
+                        println!("✗ {}: FAILED - {}", name, e);
+                        failed += 1;
+                    }
+                }
+            }
+            
+            println!("\nTotal: {} passed, {} failed", passed, failed);
+            
+            if failed > 0 {
+                panic!("{} tests failed", failed);
             }
         }
     }
