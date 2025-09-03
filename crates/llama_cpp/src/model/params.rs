@@ -193,6 +193,7 @@ impl EmbeddingsParams {
         ctx_params.n_ctx = batch_capacity as u32;
         ctx_params.n_batch = batch_capacity as u32;
         ctx_params.n_ubatch = batch_capacity as u32;
+        ctx_params.n_seq_max = (batch_capacity as u32).min(64); // Support sequences up to max of 64
         ctx_params.pooling_type = self.pooling_type.into();
 
         ctx_params

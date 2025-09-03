@@ -15,7 +15,7 @@ use tracing::{error, info, trace, warn};
 
 use backend::BackendRef;
 use llama_cpp_sys::{
-    ggml_row_size, llama_context, llama_context_params, llama_decode, llama_free, llama_model_free,
+    ggml_row_size, llama_context, llama_context_params, llama_decode, llama_encode, llama_free, llama_model_free,
     llama_get_embeddings_ith, llama_get_embeddings_seq, llama_get_memory, llama_memory_clear,
     llama_model_get_vocab, llama_model_load_from_file, llama_model, llama_model_meta_val_str,
     llama_n_ctx_train, llama_n_embd, llama_n_vocab, llama_init_from_model, llama_token,
@@ -118,6 +118,11 @@ struct EmbeddingBatch {
 pub struct LlamaModel {
     /// A handle to the inner model on the other side of the C FFI boundary.
     model: Arc<Mutex<LlamaModelInner>>,
+
+    /// Mutex to ensure only one embeddings operation runs at a time.
+    /// This is necessary because llama.cpp doesn't support parallel inference
+    /// even with separate contexts.
+    embeddings_mutex: Arc<Mutex<()>>,
 
     /// The size of this model's vocabulary, in tokens.
     vocabulary_size: usize,
@@ -252,6 +257,7 @@ impl LlamaModel {
                     model,
                     _backend_ref: backend_ref,
                 })),
+                embeddings_mutex: Arc::new(Mutex::new(())),
                 vocabulary_size: vocabulary_size as usize,
                 bos_token: Token(unsafe { 
                     let vocab = llama_model_get_vocab(model);
@@ -317,7 +323,7 @@ impl LlamaModel {
     ///
     /// * `content` - The data slice to be tokenized.
     /// * `add_bos` - Add the beginning of sentence token to the end of `content`.
-    /// * `add_bos` - Parse special tokens. If false, special tokens are parsed as if they were plain text.
+    /// * `special` - Parse special tokens. If false, special tokens are parsed as if they were plain text.
     pub fn tokenize_bytes(
         &self,
         content: impl AsRef<[u8]>,
@@ -632,7 +638,14 @@ impl LlamaModel {
             // clear previous kv_cache values (irrelevant for embeddings)
             let memory = llama_get_memory(context);
             llama_memory_clear(memory, false);
-            llama_decode(context, batch.handle())
+            
+            tracing::debug!(
+                "Calling llama_decode with batch of {} tokens, {} sequences",
+                batch.tokens(),
+                token_counts.len()
+            );
+            
+            llama_encode(context, batch.handle())
         };
 
         if res < 0 {
@@ -657,7 +670,13 @@ impl LlamaModel {
                 let mut ptr = llama_get_embeddings_seq(context, seq_id);
 
                 if ptr.is_null() && *count > 0 {
-                    ptr = llama_get_embeddings_ith(context, (*count as i32) - 1);
+                    // Calculate the correct batch index for the last token of this sequence
+                    let mut batch_index = 0;
+                    for j in 0..i {
+                        batch_index += token_counts[j];
+                    }
+                    batch_index += count - 1;
+                    ptr = llama_get_embeddings_ith(context, batch_index as i32);
                 }
 
                 if ptr.is_null() {
@@ -738,6 +757,7 @@ impl LlamaModel {
         
         for (idx, status) in classified.iter().enumerate() {
             if let InputStatus::Valid(tokens) = status {
+                tracing::debug!("Input {} has {} tokens", idx, tokens.len());
                 // Check if adding this would exceed batch capacity
                 if current_token_total > 0 && current_token_total + tokens.len() > max_batch_tokens {
                     // Create a batch with current accumulated inputs
@@ -853,6 +873,10 @@ impl LlamaModel {
         inputs: &[impl AsRef<[u8]>],
         params: EmbeddingsParams,
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        // Acquire the embeddings mutex to ensure only one embeddings operation runs at a time.
+        // This is necessary because llama.cpp doesn't support parallel inference.
+        let _embeddings_lock = self.embeddings_mutex.lock().unwrap();
+        
         // Step 1: Classify all inputs
         let classified = self.classify_inputs(inputs)?;
         
@@ -889,6 +913,13 @@ impl LlamaModel {
         } else {
             min(self.training_size, total_tokens)
         };
+        
+        tracing::debug!(
+            "Embeddings: {} inputs, {} total tokens, batch_capacity={}",
+            inputs.len(),
+            total_tokens,
+            batch_capacity
+        );
         
         // Step 6: Create batches from classified inputs
         let batches = self.create_batches(&classified, batch_capacity);
