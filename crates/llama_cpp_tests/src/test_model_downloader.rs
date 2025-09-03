@@ -54,7 +54,7 @@ impl TestModelGenerator {
 
     /// Download a small embedding model
     pub async fn download_tiny_embedding_model(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let model_name = "all-minilm-l6-v2-q4_0.gguf";
+        let model_name = "bge-base-en-v1.5-q4_k_m.gguf";
         let model_path = self.cache_dir.join(model_name);
         
         if model_path.exists() {
@@ -62,10 +62,10 @@ impl TestModelGenerator {
             return Ok(model_path);
         }
 
-        // Using All-MiniLM-L6-v2 Q4_0 - small embedding model
-        let url = "https://huggingface.co/leliuga/all-MiniLM-L6-v2-GGUF/resolve/main/all-MiniLM-L6-v2.Q4_0.gguf";
+        // Using BGE base English v1.5 Q4_K_M - embedding model (~68.3MB)
+        let url = "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q4_k_m.gguf";
         
-        println!("Downloading tiny embedding model (~23MB)...");
+        println!("Downloading tiny embedding model (~68.3MB)...");
         let response = reqwest::get(url).await?;
         
         if !response.status().is_success() {

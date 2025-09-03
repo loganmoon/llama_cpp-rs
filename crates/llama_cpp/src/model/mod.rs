@@ -15,7 +15,7 @@ use tracing::{error, info, trace, warn};
 
 use backend::BackendRef;
 use llama_cpp_sys::{
-    ggml_row_size, llama_context, llama_context_params, llama_decode, llama_model_free,
+    ggml_row_size, llama_context, llama_context_params, llama_decode, llama_free, llama_model_free,
     llama_get_embeddings_ith, llama_get_embeddings_seq, llama_get_memory, llama_memory_clear,
     llama_model_get_vocab, llama_model_load_from_file, llama_model, llama_model_meta_val_str,
     llama_n_ctx_train, llama_n_embd, llama_n_vocab, llama_init_from_model, llama_token,
@@ -87,6 +87,25 @@ impl Drop for LlamaModelInner {
             llama_model_free(self.model);
         }
     }
+}
+
+/// Internal classification of input for embedding processing
+#[derive(Debug, Clone)]
+enum InputStatus {
+    /// Valid input with tokenized representation
+    Valid(Vec<Token>),
+    /// Empty or invalid input that should receive zero embedding
+    Empty,
+}
+
+/// Internal batch representation for embeddings
+struct EmbeddingBatch {
+    /// The underlying llama.cpp batch
+    batch: Batch,
+    /// Maps batch sequences to original input array indices
+    input_indices: Vec<usize>,
+    /// Token count for each sequence in the batch
+    token_counts: Vec<usize>,
 }
 
 /// A [llama.cpp](https://github.com/ggerganov/llama.cpp/tree/master) model.
@@ -679,167 +698,153 @@ impl LlamaModel {
         Ok(embed_vec)
     }
 
-    /// Runs embeddings inference for the given inputs vector, returning the result.
-    fn embeddings_process(
-        &self,
-        inputs: Vec<Vec<Token>>,
-        params: EmbeddingsParams,
-    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
-        // Handle empty input gracefully
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
+    /// Classify inputs into Valid or Empty categories
+    fn classify_inputs(&self, inputs: &[impl AsRef<[u8]>]) -> Result<Vec<InputStatus>, LlamaTokenizationError> {
+        let mut classified = Vec::with_capacity(inputs.len());
         
-        let mut total_tokens = 0;
-        let mut max_tokens = 0;
-        let token_counts: Vec<usize> = inputs.iter().map(|v| v.len()).collect();
-        for count in &token_counts {
-            total_tokens += count;
-            if max_tokens < *count {
-                max_tokens = *count;
+        for input in inputs {
+            let input_bytes = input.as_ref();
+            
+            // Check for empty or whitespace-only inputs
+            if input_bytes.is_empty() || 
+               input_bytes.len() <= 1 ||
+               input_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
+                classified.push(InputStatus::Empty);
+                continue;
+            }
+            
+            // Tokenize the input
+            let tokens = self.tokenize_bytes(input_bytes, true, false)?;
+            
+            // BERT-style models need at least 2 tokens for proper embeddings
+            // Single-token sequences can cause matrix multiplication issues
+            if tokens.len() <= 1 {
+                classified.push(InputStatus::Empty);
+            } else {
+                classified.push(InputStatus::Valid(tokens));
             }
         }
+        
+        Ok(classified)
+    }
 
-        // If all inputs are empty, return zero embeddings for each
-        if total_tokens == 0 {
-            return Ok(vec![vec![0.0f32; self.embedding_length]; inputs.len()]);
+    /// Create batches from classified inputs
+    fn create_batches(&self, classified: &[InputStatus], max_batch_tokens: usize) -> Vec<EmbeddingBatch> {
+        let mut batches = Vec::new();
+        let mut current_batch_tokens = Vec::new();
+        let mut current_indices = Vec::new();
+        let mut current_token_counts = Vec::new();
+        let mut current_token_total = 0;
+        
+        for (idx, status) in classified.iter().enumerate() {
+            if let InputStatus::Valid(tokens) = status {
+                // Check if adding this would exceed batch capacity
+                if current_token_total > 0 && current_token_total + tokens.len() > max_batch_tokens {
+                    // Create a batch with current accumulated inputs
+                    if !current_batch_tokens.is_empty() {
+                        let max_sequences = current_indices.len().max(1);
+                        let mut batch = Batch::new(current_token_total, 0, max_sequences);
+                        
+                        // Add all tokens to batch with sequential IDs
+                        let mut seq_id = 0i32;
+                        let mut token_offset = 0;
+                        for token_count in &current_token_counts {
+                            for pos in 0..*token_count {
+                                let is_last = pos == token_count - 1;
+                                batch.add(
+                                    current_batch_tokens[token_offset + pos],
+                                    pos,
+                                    &[seq_id],
+                                    is_last
+                                );
+                            }
+                            token_offset += token_count;
+                            seq_id += 1;
+                        }
+                        
+                        batches.push(EmbeddingBatch {
+                            batch,
+                            input_indices: current_indices.clone(),
+                            token_counts: current_token_counts.clone(),
+                        });
+                    }
+                    
+                    // Reset for new batch
+                    current_batch_tokens.clear();
+                    current_indices.clear();
+                    current_token_counts.clear();
+                    current_token_total = 0;
+                }
+                
+                // Add to current batch
+                current_batch_tokens.extend_from_slice(tokens);
+                current_indices.push(idx);
+                current_token_counts.push(tokens.len());
+                current_token_total += tokens.len();
+            }
         }
         
-        // Also check if all inputs tokenize to zero tokens after processing
-        let non_empty_count = inputs.iter().filter(|v| !v.is_empty()).count();
-        if non_empty_count == 0 {
-            // All inputs are empty, return zero embeddings without creating context
-            return Ok(vec![vec![0.0f32; self.embedding_length]; inputs.len()]);
-        }
-
-        let batch_capacity = if max_tokens > self.training_size {
-            warn!("Large embedding input requires a context larger than the model's training context.");
-            max_tokens
-        } else {
-            min(self.training_size, total_tokens)
-        };
-        // Max sequences should be the number of non-empty inputs we'll actually process
-        // Count how many inputs will actually be added to the batch
-        let actual_sequences = inputs.iter().filter(|v| !v.is_empty()).count();
-        if actual_sequences == 0 {
-            // All inputs are empty after tokenization, return zero embeddings
-            return Ok(vec![vec![0.0f32; self.embedding_length]; inputs.len()]);
+        // Create final batch if there are remaining inputs
+        if !current_batch_tokens.is_empty() {
+            let max_sequences = current_indices.len().max(1);
+            let mut batch = Batch::new(current_token_total, 0, max_sequences);
+            
+            // Add all tokens to batch with sequential IDs
+            let mut seq_id = 0i32;
+            let mut token_offset = 0;
+            for token_count in &current_token_counts {
+                for pos in 0..*token_count {
+                    let is_last = pos == token_count - 1;
+                    batch.add(
+                        current_batch_tokens[token_offset + pos],
+                        pos,
+                        &[seq_id],
+                        is_last
+                    );
+                }
+                token_offset += token_count;
+                seq_id += 1;
+            }
+            
+            batches.push(EmbeddingBatch {
+                batch,
+                input_indices: current_indices,
+                token_counts: current_token_counts,
+            });
         }
         
-        let max_sequences = actual_sequences.max(1);
-        // Note: The embd parameter seems to be needed for embeddings in this implementation
-        let mut batch = Batch::new(batch_capacity, self.embedding_length, max_sequences);
-        tracing::debug!(
-            "Batch initialized: capacity={}, embed_length={}, max_seq={}, actual_sequences={}",
-            batch_capacity, self.embedding_length, max_sequences, actual_sequences
-        );
+        batches
+    }
 
-        let context_params = params.as_context_params(batch_capacity);
+    /// Create an embeddings context
+    fn create_embeddings_context(&self, capacity: usize, params: &EmbeddingsParams) -> Result<*mut llama_context, LlamaContextError> {
+        let context_params = params.as_context_params(capacity);
         let context = unsafe {
             let model_lock = self.model.lock().unwrap();
-
             // SAFETY: due to `_model` being declared in the `LlamaContext`, `self` must live
             // for at least the lifetime of `LlamaContext`.
             llama_init_from_model(**model_lock, context_params)
         };
         
-        tracing::debug!(
-            "Context created for embeddings: batch_capacity={}, embeddings=true",
-            batch_capacity
-        );
-
         if context.is_null() {
             return Err(LlamaContextError::SessionFailed);
         }
+        
+        Ok(context)
+    }
 
-        // Process inputs, keeping track of which ones are empty
-        let mut result_embeddings = vec![None; inputs.len()];
-        let mut batch_indices = Vec::new();
-        let mut batch_token_counts = Vec::new();
-        let mut processed_count = 0usize;  // Track number of processed sequences
+    /// Process a single batch and return embeddings
+    fn process_batch(&self, context: *mut llama_context, batch: &EmbeddingBatch) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        // Create sequential IDs for this batch
+        let batch_seq_ids: Vec<i32> = (0..batch.token_counts.len() as i32).collect();
         
-        for (idx, input) in inputs.iter().enumerate() {
-            if input.is_empty() {
-                // For empty inputs, directly set a zero embedding
-                result_embeddings[idx] = Some(vec![0.0f32; self.embedding_length]);
-                continue;
-            }
-            
-            // Skip single-token sequences - they lack proper formatting for embeddings
-            // This works around GGML matrix multiplication issues with very short sequences
-            if input.len() <= 1 {
-                tracing::debug!("Skipping single-token sequence at index {}, providing zero embedding", idx);
-                result_embeddings[idx] = Some(vec![0.0f32; self.embedding_length]);
-                continue;
-            }
-            
-            // Check if adding this input would exceed batch capacity
-            if batch.tokens() + input.len() > batch_capacity {
-                // Process current batch
-                if !batch_indices.is_empty() {
-                    trace!("Decoding {} embedding tokens", batch.tokens());
-                    let batch_seq_ids: Vec<i32> = (0..batch_token_counts.len() as i32).collect();
-                    let decoded = self.embeddings_decode(
-                        context,
-                        &batch,
-                        &batch_token_counts,
-                        &batch_seq_ids,
-                    )?;
-                    
-                    // Store results in correct positions
-                    for (i, &idx) in batch_indices.iter().enumerate() {
-                        result_embeddings[idx] = Some(decoded[i].clone());
-                    }
-                    
-                    batch.clear();
-                    batch_indices.clear();
-                    batch_token_counts.clear();
-                    processed_count = 0;  // Reset sequence counter for new batch
-                }
-            }
-            
-            // Add tokens to batch with consistent sequence IDs
-            trace!("Adding {} tokens to batch for input {}", input.len(), idx);
-            for (i, token) in input.iter().enumerate() {
-                let is_last = i == input.len() - 1;
-                // Use processed count as sequence ID for consistency
-                let seq_id = processed_count as i32;
-                // For embeddings, we need logits for the last token of each sequence
-                // to get the pooled representation
-                tracing::debug!(
-                    "Adding token: token={:?}, pos={}, seq_id={}, logits={}", 
-                    *token, i, seq_id, is_last
-                );
-                batch.add(*token, i, &[seq_id], is_last);
-            }
-            batch_indices.push(idx);
-            batch_token_counts.push(input.len());
-            processed_count += 1;  // Track how many sequences we've processed
-        }
-        
-        // Process any remaining batch
-        if !batch_indices.is_empty() {
-            trace!("Decoding remaining {} embedding tokens", batch.tokens());
-            let batch_seq_ids: Vec<i32> = (0..batch_token_counts.len() as i32).collect();
-            let decoded = self.embeddings_decode(
-                context,
-                &batch,
-                &batch_token_counts,
-                &batch_seq_ids,
-            )?;
-            
-            // Store results in correct positions
-            for (i, &idx) in batch_indices.iter().enumerate() {
-                result_embeddings[idx] = Some(decoded[i].clone());
-            }
-        }
-        
-        // Convert Option<Vec<f32>> to Vec<Vec<f32>>
-        let out = result_embeddings.into_iter()
-            .map(|opt| opt.expect("All embeddings should be set"))
-            .collect();
-        
-        Ok(out)
+        // Decode the batch
+        self.embeddings_decode(
+            context,
+            &batch.batch,
+            &batch.token_counts,
+            &batch_seq_ids,
+        )
     }
 
     /// Runs embeddings inference for the given inputs, returning the result.
@@ -848,59 +853,71 @@ impl LlamaModel {
         inputs: &[impl AsRef<[u8]>],
         params: EmbeddingsParams,
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
-        // Return zero embeddings for empty strings without tokenizing
-        let mut results = Vec::with_capacity(inputs.len());
-        let mut non_empty_indices = Vec::new();
-        let mut non_empty_inputs = Vec::new();
+        // Step 1: Classify all inputs
+        let classified = self.classify_inputs(inputs)?;
         
-        for (idx, input) in inputs.iter().enumerate() {
-            let input_bytes = input.as_ref();
-            // Skip empty inputs and single-character/whitespace-only inputs
-            // These cause GGML matrix multiplication issues
-            if input_bytes.is_empty() || 
-               input_bytes.len() <= 1 || 
-               input_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
-                tracing::debug!("Skipping edge case input at index {}: empty or whitespace-only", idx);
-                results.push(Some(vec![0.0f32; self.embedding_length]));
-            } else {
-                results.push(None);
-                non_empty_indices.push(idx);
-                non_empty_inputs.push(input_bytes);
+        // Step 2: Initialize results array with proper size
+        let mut results = vec![None; inputs.len()];
+        
+        // Step 3: Handle empty inputs by assigning zero embeddings
+        for (idx, status) in classified.iter().enumerate() {
+            if matches!(status, InputStatus::Empty) {
+                results[idx] = Some(vec![0.0f32; self.embedding_length]);
             }
         }
         
-        // Process non-empty inputs
-        if !non_empty_inputs.is_empty() {
-            let tokenized = self.tokenize_slice(&non_empty_inputs, true, false)?;
-            
-            // Filter out inputs that tokenized to zero tokens
-            let mut valid_tokenized = Vec::new();
-            let mut valid_indices = Vec::new();
-            
-            for (i, tokens) in tokenized.iter().enumerate() {
-                if !tokens.is_empty() {
-                    valid_tokenized.push(tokens.clone());
-                    valid_indices.push(non_empty_indices[i]);
-                } else {
-                    // Provide default zero embedding for inputs that tokenized to zero tokens
-                    trace!("Input {} tokenized to zero tokens, providing zero embedding", non_empty_indices[i]);
-                    results[non_empty_indices[i]] = Some(vec![0.0f32; self.embedding_length]);
-                }
-            }
-            
-            // Only process if we have valid tokenized inputs
-            if !valid_tokenized.is_empty() {
-                let embeddings = self.embeddings_process(valid_tokenized, params)?;
-                
-                // Place results in correct positions
-                for (i, idx) in valid_indices.iter().enumerate() {
-                    results[*idx] = Some(embeddings[i].clone());
-                }
+        // Step 4: Check if there are any valid inputs to process
+        let has_valid = classified.iter().any(|s| matches!(s, InputStatus::Valid(_)));
+        if !has_valid {
+            // All inputs are empty, return zero embeddings
+            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+        }
+        
+        // Step 5: Calculate batch capacity
+        let mut total_tokens = 0;
+        let mut max_tokens = 0;
+        for status in &classified {
+            if let InputStatus::Valid(tokens) = status {
+                total_tokens += tokens.len();
+                max_tokens = max_tokens.max(tokens.len());
             }
         }
         
-        // Convert Option<Vec<f32>> to Vec<Vec<f32>>
-        Ok(results.into_iter().map(|opt| opt.unwrap()).collect())
+        let batch_capacity = if max_tokens > self.training_size {
+            warn!("Large embedding input requires a context larger than the model's training context.");
+            max_tokens
+        } else {
+            min(self.training_size, total_tokens)
+        };
+        
+        // Step 6: Create batches from classified inputs
+        let batches = self.create_batches(&classified, batch_capacity);
+        
+        if batches.is_empty() {
+            // No valid batches to process
+            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+        }
+        
+        // Step 7: Create context for embeddings
+        let context = self.create_embeddings_context(batch_capacity, &params)?;
+        
+        // Step 8: Process each batch
+        for batch in batches {
+            let embeddings = self.process_batch(context, &batch)?;
+            
+            // Map embeddings back to original indices
+            for (i, &original_idx) in batch.input_indices.iter().enumerate() {
+                results[original_idx] = Some(embeddings[i].clone());
+            }
+        }
+        
+        // Step 9: Free context
+        unsafe {
+            llama_free(context);
+        }
+        
+        // Step 10: Convert Option<Vec<f32>> to Vec<Vec<f32>>
+        Ok(results.into_iter().map(|r| r.expect("All results should be set")).collect())
     }
 
     /// Runs embeddings inference for the given inputs, returning the result.
