@@ -726,7 +726,7 @@ impl LlamaModel {
             
             // Check for empty or whitespace-only inputs
             if input_bytes.is_empty() || 
-               input_bytes.len() <= 1 ||
+               input_bytes.len() <= 2 ||
                input_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
                 classified.push(InputStatus::Empty);
                 continue;
@@ -737,7 +737,7 @@ impl LlamaModel {
             
             // BERT-style models need at least 2 tokens for proper embeddings
             // Single-token sequences can cause matrix multiplication issues
-            if tokens.len() <= 1 {
+            if tokens.len() <= 2 {
                 classified.push(InputStatus::Empty);
             } else {
                 classified.push(InputStatus::Valid(tokens));
@@ -971,6 +971,98 @@ impl LlamaModel {
         })
             .await
             .unwrap()
+    }
+
+    /// Generate embeddings using a provided session.
+    /// 
+    /// This is more efficient than the standard embeddings() method when processing
+    /// multiple batches, as it reuses the session context instead of creating
+    /// temporary contexts.
+    /// 
+    /// # Arguments
+    /// * `session` - The session to use for embeddings generation
+    /// * `inputs` - The input strings to generate embeddings for
+    /// * `params` - Parameters controlling the embeddings generation
+    /// 
+    /// # Example
+    /// ```no_run
+    /// # use llama_cpp::{LlamaModel, SessionParams, EmbeddingsParams};
+    /// # let model = LlamaModel::load_from_file("model.gguf", Default::default()).unwrap();
+    /// let params = SessionParams {
+    ///     embedding: true,
+    ///     ..Default::default()
+    /// };
+    /// let session = model.create_session(params).unwrap();
+    /// 
+    /// let embeddings = model.embeddings_with_session(
+    ///     &session,
+    ///     &["Hello world", "Another text"],
+    ///     EmbeddingsParams::default()
+    /// ).unwrap();
+    /// ```
+    pub fn embeddings_with_session(
+        &self,
+        session: &LlamaSession,
+        inputs: &[impl AsRef<[u8]>],
+        _params: EmbeddingsParams,
+    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        // Use the same mutex to maintain thread safety
+        let _embeddings_lock = self.embeddings_mutex.lock().unwrap();
+        
+        // Save current session mode to restore later
+        let was_in_embeddings_mode = session.inner.params.embedding;
+        
+        // Enable embeddings mode
+        session.set_embeddings_mode(true);
+        
+        // Process inputs using existing classification logic
+        let classified_inputs = self.classify_inputs(inputs)?;
+        
+        let mut all_embeddings = Vec::with_capacity(inputs.len());
+        
+        // Process each input
+        for status in classified_inputs {
+            match status {
+                InputStatus::Valid(tokens) => {
+                    // Process tokens through session
+                    session.encode_for_embeddings(&tokens)?;
+                    
+                    // Extract embeddings
+                    let embedding = session.get_embeddings(self.embedding_length)?;
+                    all_embeddings.push(embedding);
+                }
+                InputStatus::Empty => {
+                    // Return zero vector for empty inputs
+                    all_embeddings.push(vec![0.0; self.embedding_length]);
+                }
+            }
+        }
+        
+        // Restore previous mode if different
+        if !was_in_embeddings_mode {
+            session.set_embeddings_mode(false);
+        }
+        
+        Ok(all_embeddings)
+    }
+
+    /// Async version of embeddings_with_session
+    pub async fn embeddings_with_session_async(
+        &self,
+        session: &LlamaSession,
+        inputs: &[impl AsRef<[u8]>],
+        params: EmbeddingsParams,
+    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        let model = self.clone();
+        let session = session.clone();
+        let inputs = inputs.iter().map(|i| i.as_ref().to_vec()).collect::<Vec<_>>();
+        
+        tokio::task::spawn_blocking(move || {
+            let inputs_refs: Vec<&[u8]> = inputs.iter().map(|v| v.as_slice()).collect();
+            model.embeddings_with_session(&session, &inputs_refs, params)
+        })
+        .await
+        .map_err(|e| LlamaContextError::Unknown(e.to_string()))?
     }
 
     /// Return an estimation of how much memory embeddings generation is gonna require for the provided parameters and

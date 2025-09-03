@@ -12,9 +12,10 @@ use tokio::sync::mpsc::unbounded_channel;
 use tracing::{error, info, trace, warn};
 
 use llama_cpp_sys::{
-    llama_context, llama_copy_state_data, llama_decode, llama_free, llama_get_logits_ith,
-    llama_get_memory, llama_get_state_size, llama_memory_seq_rm, llama_set_state_data,
-    llama_token_data, llama_token_data_array,
+    llama_context, llama_copy_state_data, llama_decode, llama_encode, llama_free, 
+    llama_get_embeddings_ith, llama_get_embeddings_seq, llama_get_logits_ith,
+    llama_get_memory, llama_get_state_size, llama_memory_seq_rm, llama_set_embeddings, 
+    llama_set_state_data, llama_token_data, llama_token_data_array,
 };
 
 use crate::standard_sampler::StandardSampler;
@@ -118,6 +119,10 @@ pub enum LlamaContextError {
     /// Tried to start completing before advancing the context.
     #[error("cannot start completing without any history")]
     NoContext,
+
+    /// An unknown error occurred
+    #[error("unknown error: {0}")]
+    Unknown(String),
 }
 
 impl LlamaSession {
@@ -550,5 +555,96 @@ impl LlamaSession {
     pub fn memory_size(&self) -> usize {
         let ctx = self.inner.ctx.lock().unwrap();
         unsafe { llama_get_state_size(**ctx) }
+    }
+    
+    /// Enable or disable embeddings mode for this session.
+    /// 
+    /// When enabled, the session will compute embeddings instead of logits.
+    /// Note: Switching modes may affect performance if done frequently.
+    pub fn set_embeddings_mode(&self, enable: bool) {
+        let ctx = self.inner.ctx.lock().unwrap();
+        unsafe {
+            llama_set_embeddings(ctx.ptr, enable);
+        }
+    }
+    
+    /// Process tokens for embeddings without advancing the context.
+    /// 
+    /// This is similar to advance_context but optimized for embeddings extraction.
+    pub fn encode_for_embeddings(&self, tokens: &[Token]) -> Result<(), LlamaContextError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+
+        let ctx = self.inner.ctx.lock().unwrap();
+        let mut batch = Batch::new(tokens.len(), 0, 1);
+
+        // Add all tokens to batch with sequence ID 0
+        for (pos, &token) in tokens.iter().enumerate() {
+            let is_last = pos == tokens.len() - 1;
+            let result = batch.add(token, pos, &[0], is_last);
+            if result == usize::MAX {
+                return Err(LlamaContextError::EmbeddingsFailed(
+                    "Failed to add token to batch: batch full or too many sequences".to_string()
+                ));
+            }
+        }
+
+        // Use llama_encode instead of llama_decode for embeddings
+        let res = unsafe { llama_encode(ctx.ptr, batch.handle()) };
+        
+        if res != 0 {
+            return Err(LlamaContextError::DecodeFailed(res));
+        }
+
+        Ok(())
+    }
+
+    /// Extract embeddings for the last processed sequence.
+    /// 
+    /// Returns normalized embedding vectors. The session must be in embeddings mode
+    /// and have processed tokens using encode_for_embeddings.
+    pub fn get_embeddings(&self, embedding_size: usize) -> Result<Vec<f32>, LlamaContextError> {
+        let ctx = self.inner.ctx.lock().unwrap();
+        
+        // Try to get embeddings for sequence 0
+        let embeddings_ptr = unsafe { llama_get_embeddings_seq(ctx.ptr, 0) };
+        
+        let embeddings_ptr = if embeddings_ptr.is_null() {
+            // Fallback to ith variant for batch position 0
+            let fallback_ptr = unsafe { llama_get_embeddings_ith(ctx.ptr, 0) };
+            if fallback_ptr.is_null() {
+                return Err(LlamaContextError::EmbeddingsFailed(
+                    "Failed to retrieve embeddings from session".to_string()
+                ));
+            }
+            fallback_ptr
+        } else {
+            embeddings_ptr
+        };
+
+        // Copy and normalize embeddings
+        let mut embedding = Vec::with_capacity(embedding_size);
+        unsafe {
+            for i in 0..embedding_size {
+                embedding.push(*embeddings_ptr.add(i));
+            }
+        }
+
+        // Apply L2 normalization
+        self.normalize_embedding(&mut embedding);
+        
+        Ok(embedding)
+    }
+
+    /// Apply L2 normalization to embedding vector
+    fn normalize_embedding(&self, embedding: &mut [f32]) {
+        let sum_squares: f32 = embedding.iter().map(|x| x * x).sum();
+        if sum_squares > 0.0 {
+            let norm = sum_squares.sqrt();
+            for value in embedding.iter_mut() {
+                *value /= norm;
+            }
+        }
     }
 }

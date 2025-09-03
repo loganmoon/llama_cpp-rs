@@ -319,6 +319,21 @@ impl Default for SessionParams {
     }
 }
 
+impl SessionParams {
+    /// Create session parameters optimized for embeddings extraction.
+    /// 
+    /// Sets appropriate values for embedding mode, context size, and batch processing.
+    pub fn for_embeddings() -> Self {
+        Self {
+            embedding: true,
+            n_ctx: 2048,
+            n_batch: 2048,
+            n_threads: (num_cpus::get_physical().saturating_sub(1).max(1)) as u32,
+            ..Default::default()
+        }
+    }
+}
+
 impl From<SessionParams> for llama_context_params {
     fn from(value: SessionParams) -> Self {
         Self {

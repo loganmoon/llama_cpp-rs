@@ -171,6 +171,7 @@ impl From<LlamaParams> for llama_model_params {
 }
 
 /// Embeddings inference specific parameters.
+#[derive(Clone, Copy)]
 pub struct EmbeddingsParams {
     /// number of threads to use for generation
     pub n_threads: u32,

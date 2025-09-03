@@ -300,4 +300,106 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn embed_with_session() {
+        init_tracing();
+        ensure_test_models();
+
+        let dir = std::env::var("LLAMA_EMBED_MODELS_DIR")
+            .expect("LLAMA_EMBED_MODELS_DIR should be set by test setup");
+
+        let models = list_models(dir).await;
+        
+        // Test with first embedding model
+        if let Some(model_path) = models.first() {
+            let model_params = LlamaParams::default();
+            
+            let model = LlamaModel::load_from_file_async(model_path, model_params)
+                .await
+                .expect("Failed to load embedding model");
+
+            // Create session for embeddings
+            let session_params = SessionParams::for_embeddings();
+            let session = model.create_session(session_params)
+                .expect("Failed to create embeddings session");
+
+            // Test inputs
+            let inputs = vec![
+                "The quick brown fox jumps over the lazy dog",
+                "Machine learning is a subset of artificial intelligence",
+                "Rust is a systems programming language",
+            ];
+
+            // Generate embeddings with session
+            let embeddings = model
+                .embeddings_with_session(&session, &inputs, EmbeddingsParams::default())
+                .expect("Failed to generate embeddings with session");
+
+            // Validate results
+            assert_eq!(embeddings.len(), inputs.len());
+            for (i, embedding) in embeddings.iter().enumerate() {
+                assert!(!embedding.is_empty(), "Embedding {} is empty", i);
+                
+                // Check normalization
+                let magnitude: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert!((magnitude - 1.0).abs() < 0.01, "Embedding {} not normalized", i);
+            }
+
+            // Test mode switching
+            session.set_embeddings_mode(false);
+            session.set_embeddings_mode(true);
+            
+            // Generate again to ensure mode switching works
+            let embeddings2 = model
+                .embeddings_with_session(&session, &inputs[..1], EmbeddingsParams::default())
+                .expect("Failed after mode switch");
+            
+            assert_eq!(embeddings2.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_session_performance_comparison() {
+        init_tracing();
+        ensure_test_models();
+
+        let dir = std::env::var("LLAMA_EMBED_MODELS_DIR")
+            .expect("LLAMA_EMBED_MODELS_DIR should be set by test setup");
+
+        let models = list_models(dir).await;
+        
+        if let Some(model_path) = models.first() {
+            let model = LlamaModel::load_from_file_async(model_path, LlamaParams::default())
+                .await
+                .expect("Failed to load model");
+
+            let inputs = vec!["Test input"; 10];
+            let params = EmbeddingsParams::default();
+
+            // Time temporary context approach
+            let start_temp = std::time::Instant::now();
+            for _ in 0..3 {
+                let _ = model.embeddings(&inputs, params).expect("Temporary context failed");
+            }
+            let duration_temp = start_temp.elapsed();
+
+            // Time session-based approach
+            let session = model.create_session(SessionParams::for_embeddings())
+                .expect("Failed to create session");
+            
+            let start_session = std::time::Instant::now();
+            for _ in 0..3 {
+                let _ = model.embeddings_with_session(&session, &inputs, params)
+                    .expect("Session-based failed");
+            }
+            let duration_session = start_session.elapsed();
+
+            println!("Temporary context: {:?}", duration_temp);
+            println!("Session-based: {:?}", duration_session);
+            
+            // Session approach should be faster for repeated calls
+            // We don't assert this as performance can vary, but log for manual verification
+        }
+    }
+
 }
