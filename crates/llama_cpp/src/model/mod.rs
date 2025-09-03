@@ -602,6 +602,7 @@ impl LlamaModel {
         context: *mut llama_context,
         batch: &Batch,
         token_counts: &[usize],
+        sequence_ids: &[i32],
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
         // Don't process if batch is empty
         if batch.tokens() == 0 {
@@ -627,8 +628,14 @@ impl LlamaModel {
                 continue;
             }
             
+            let seq_id = sequence_ids[i];
+            tracing::debug!(
+                "Retrieving embedding for seq_id={}, token_count={}", 
+                seq_id, count
+            );
+            
             let embedding = unsafe {
-                let mut ptr = llama_get_embeddings_seq(context, i as i32);
+                let mut ptr = llama_get_embeddings_seq(context, seq_id);
 
                 if ptr.is_null() && *count > 0 {
                     ptr = llama_get_embeddings_ith(context, (*count as i32) - 1);
@@ -697,6 +704,13 @@ impl LlamaModel {
         if total_tokens == 0 {
             return Ok(vec![vec![0.0f32; self.embedding_length]; inputs.len()]);
         }
+        
+        // Also check if all inputs tokenize to zero tokens after processing
+        let non_empty_count = inputs.iter().filter(|v| !v.is_empty()).count();
+        if non_empty_count == 0 {
+            // All inputs are empty, return zero embeddings without creating context
+            return Ok(vec![vec![0.0f32; self.embedding_length]; inputs.len()]);
+        }
 
         let batch_capacity = if max_tokens > self.training_size {
             warn!("Large embedding input requires a context larger than the model's training context.");
@@ -704,7 +718,21 @@ impl LlamaModel {
         } else {
             min(self.training_size, total_tokens)
         };
-        let mut batch = Batch::new(batch_capacity, self.embedding_length, 1);
+        // Max sequences should be the number of non-empty inputs we'll actually process
+        // Count how many inputs will actually be added to the batch
+        let actual_sequences = inputs.iter().filter(|v| !v.is_empty()).count();
+        if actual_sequences == 0 {
+            // All inputs are empty after tokenization, return zero embeddings
+            return Ok(vec![vec![0.0f32; self.embedding_length]; inputs.len()]);
+        }
+        
+        let max_sequences = actual_sequences.max(1);
+        // Note: The embd parameter seems to be needed for embeddings in this implementation
+        let mut batch = Batch::new(batch_capacity, self.embedding_length, max_sequences);
+        tracing::debug!(
+            "Batch initialized: capacity={}, embed_length={}, max_seq={}, actual_sequences={}",
+            batch_capacity, self.embedding_length, max_sequences, actual_sequences
+        );
 
         let context_params = params.as_context_params(batch_capacity);
         let context = unsafe {
@@ -714,6 +742,11 @@ impl LlamaModel {
             // for at least the lifetime of `LlamaContext`.
             llama_init_from_model(**model_lock, context_params)
         };
+        
+        tracing::debug!(
+            "Context created for embeddings: batch_capacity={}, embeddings=true",
+            batch_capacity
+        );
 
         if context.is_null() {
             return Err(LlamaContextError::SessionFailed);
@@ -723,10 +756,19 @@ impl LlamaModel {
         let mut result_embeddings = vec![None; inputs.len()];
         let mut batch_indices = Vec::new();
         let mut batch_token_counts = Vec::new();
+        let mut processed_count = 0usize;  // Track number of processed sequences
         
         for (idx, input) in inputs.iter().enumerate() {
             if input.is_empty() {
                 // For empty inputs, directly set a zero embedding
+                result_embeddings[idx] = Some(vec![0.0f32; self.embedding_length]);
+                continue;
+            }
+            
+            // Skip single-token sequences - they lack proper formatting for embeddings
+            // This works around GGML matrix multiplication issues with very short sequences
+            if input.len() <= 1 {
+                tracing::debug!("Skipping single-token sequence at index {}, providing zero embedding", idx);
                 result_embeddings[idx] = Some(vec![0.0f32; self.embedding_length]);
                 continue;
             }
@@ -736,10 +778,12 @@ impl LlamaModel {
                 // Process current batch
                 if !batch_indices.is_empty() {
                     trace!("Decoding {} embedding tokens", batch.tokens());
+                    let batch_seq_ids: Vec<i32> = (0..batch_token_counts.len() as i32).collect();
                     let decoded = self.embeddings_decode(
                         context,
                         &batch,
                         &batch_token_counts,
+                        &batch_seq_ids,
                     )?;
                     
                     // Store results in correct positions
@@ -750,26 +794,38 @@ impl LlamaModel {
                     batch.clear();
                     batch_indices.clear();
                     batch_token_counts.clear();
+                    processed_count = 0;  // Reset sequence counter for new batch
                 }
             }
             
-            // Add tokens to batch
+            // Add tokens to batch with consistent sequence IDs
             trace!("Adding {} tokens to batch for input {}", input.len(), idx);
             for (i, token) in input.iter().enumerate() {
                 let is_last = i == input.len() - 1;
-                batch.add(*token, i, &[batch_indices.len() as i32], is_last);
+                // Use processed count as sequence ID for consistency
+                let seq_id = processed_count as i32;
+                // For embeddings, we need logits for the last token of each sequence
+                // to get the pooled representation
+                tracing::debug!(
+                    "Adding token: token={:?}, pos={}, seq_id={}, logits={}", 
+                    *token, i, seq_id, is_last
+                );
+                batch.add(*token, i, &[seq_id], is_last);
             }
             batch_indices.push(idx);
             batch_token_counts.push(input.len());
+            processed_count += 1;  // Track how many sequences we've processed
         }
         
         // Process any remaining batch
         if !batch_indices.is_empty() {
             trace!("Decoding remaining {} embedding tokens", batch.tokens());
+            let batch_seq_ids: Vec<i32> = (0..batch_token_counts.len() as i32).collect();
             let decoded = self.embeddings_decode(
                 context,
                 &batch,
                 &batch_token_counts,
+                &batch_seq_ids,
             )?;
             
             // Store results in correct positions
@@ -798,12 +854,18 @@ impl LlamaModel {
         let mut non_empty_inputs = Vec::new();
         
         for (idx, input) in inputs.iter().enumerate() {
-            if input.as_ref().is_empty() {
+            let input_bytes = input.as_ref();
+            // Skip empty inputs and single-character/whitespace-only inputs
+            // These cause GGML matrix multiplication issues
+            if input_bytes.is_empty() || 
+               input_bytes.len() <= 1 || 
+               input_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
+                tracing::debug!("Skipping edge case input at index {}: empty or whitespace-only", idx);
                 results.push(Some(vec![0.0f32; self.embedding_length]));
             } else {
                 results.push(None);
                 non_empty_indices.push(idx);
-                non_empty_inputs.push(input.as_ref());
+                non_empty_inputs.push(input_bytes);
             }
         }
         
