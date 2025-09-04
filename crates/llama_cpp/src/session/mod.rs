@@ -14,8 +14,8 @@ use tracing::{error, info, trace, warn};
 use llama_cpp_sys::{
     llama_context, llama_copy_state_data, llama_decode, llama_encode, llama_free, 
     llama_get_embeddings_ith, llama_get_embeddings_seq, llama_get_logits_ith,
-    llama_get_memory, llama_get_state_size, llama_memory_seq_rm, llama_set_embeddings, 
-    llama_set_state_data, llama_token_data, llama_token_data_array,
+    llama_get_memory, llama_get_state_size, llama_memory_clear, llama_memory_seq_rm, 
+    llama_set_embeddings, llama_set_state_data, llama_token_data, llama_token_data_array,
 };
 
 use crate::standard_sampler::StandardSampler;
@@ -646,5 +646,18 @@ impl LlamaSession {
                 *value /= norm;
             }
         }
+    }
+    
+    /// Clear the KV cache for fresh embeddings processing.
+    /// 
+    /// This ensures each batch starts with a clean state.
+    pub fn clear_kv_cache(&self) -> Result<(), LlamaContextError> {
+        let ctx = self.inner.ctx.lock().unwrap();
+        unsafe {
+            // Clear all cache data
+            let memory = llama_get_memory(ctx.ptr);
+            llama_memory_clear(memory, false);
+        }
+        Ok(())
     }
 }

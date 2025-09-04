@@ -2,6 +2,7 @@
 
 use std::borrow::Borrow;
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::ffi::{c_char, CStr, CString};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -108,13 +109,67 @@ struct EmbeddingBatch {
     token_counts: Vec<usize>,
 }
 
+/// Batch structure for session-based embeddings processing.
+#[derive(Debug)]
+struct SessionEmbeddingBatch {
+    inputs: Vec<(usize, Vec<Token>)>,
+}
+
+impl SessionEmbeddingBatch {
+    fn new() -> Self {
+        Self { inputs: Vec::new() }
+    }
+    
+    fn add_input(&mut self, index: usize, tokens: Vec<Token>) {
+        self.inputs.push((index, tokens));
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.inputs.is_empty()
+    }
+}
+
+/// Internal pool for caching embeddings sessions.
+struct EmbeddingsSessionPool {
+    /// Available sessions ready for use
+    available: VecDeque<Arc<LlamaSession>>,
+    /// Maximum number of sessions to keep in pool
+    max_size: usize,
+}
+
+impl EmbeddingsSessionPool {
+    fn new(max_size: usize) -> Self {
+        Self {
+            available: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+    
+    /// Get a session from the pool or None if empty.
+    fn get(&mut self) -> Option<Arc<LlamaSession>> {
+        self.available.pop_front()
+    }
+    
+    /// Return a session to the pool.
+    fn put(&mut self, session: Arc<LlamaSession>) {
+        if self.available.len() < self.max_size {
+            self.available.push_back(session);
+        }
+        // If pool is full, let the session be dropped
+    }
+    
+    /// Check if pool has available sessions.
+    fn is_empty(&self) -> bool {
+        self.available.is_empty()
+    }
+}
+
 /// A [llama.cpp](https://github.com/ggerganov/llama.cpp/tree/master) model.
 ///
 /// At present, these can only be loaded from GGML's model file format, [GGUF][gguf], via
 /// [`LlamaModel::load_from_file`].
 ///
 /// [gguf]: https://github.com/ggerganov/ggml/pull/302
-#[derive(Clone)]
 pub struct LlamaModel {
     /// A handle to the inner model on the other side of the C FFI boundary.
     model: Arc<Mutex<LlamaModelInner>>,
@@ -170,9 +225,48 @@ pub struct LlamaModel {
     ssm_d_inner: usize,
     /// State Space Models state size
     ssm_d_state: usize,
+    
+    /// Pool of cached embeddings sessions (lazy initialized)
+    embeddings_session_pool: Arc<RwLock<Option<EmbeddingsSessionPool>>>,
 }
 
 unsafe impl Send for LlamaModel {}
+
+impl Clone for LlamaModel {
+    fn clone(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            embeddings_mutex: self.embeddings_mutex.clone(),
+            vocabulary_size: self.vocabulary_size,
+            bos_token: self.bos_token,
+            eos_token: self.eos_token,
+            nl_token: self.nl_token,
+            infill_prefix_token: self.infill_prefix_token,
+            infill_middle_token: self.infill_middle_token,
+            infill_suffix_token: self.infill_suffix_token,
+            eot_token: self.eot_token,
+            embedding_length: self.embedding_length,
+            training_size: self.training_size,
+            layers: self.layers,
+            kv_heads: self.kv_heads,
+            k_attention: self.k_attention,
+            v_attention: self.v_attention,
+            ssm_d_conv: self.ssm_d_conv,
+            ssm_d_inner: self.ssm_d_inner,
+            ssm_d_state: self.ssm_d_state,
+            embeddings_session_pool: Arc::new(RwLock::new(None)), // New pool for clone
+        }
+    }
+}
+
+impl Drop for LlamaModel {
+    fn drop(&mut self) {
+        // Clear session pool to free resources
+        if let Ok(mut pool_guard) = self.embeddings_session_pool.write() {
+            *pool_guard = None;
+        }
+    }
+}
 
 impl LlamaModel {
     /// Loads a LLaMA model from a compatible GGUF (`.gguf`) file.
@@ -296,6 +390,7 @@ impl LlamaModel {
                 ssm_d_conv,
                 ssm_d_inner,
                 ssm_d_state,
+                embeddings_session_pool: Arc::new(RwLock::new(None)),
             })
         }
     }
@@ -868,7 +963,48 @@ impl LlamaModel {
     }
 
     /// Runs embeddings inference for the given inputs, returning the result.
+    /// 
+    /// This method now uses an internal session pool for improved performance
+    /// when called multiple times. The API remains unchanged for backwards
+    /// compatibility.
     pub fn embeddings(
+        &self,
+        inputs: &[impl AsRef<[u8]>],
+        params: EmbeddingsParams,
+    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        // Try session pool approach first
+        match self.embeddings_with_pool(inputs, params) {
+            Ok(embeddings) => Ok(embeddings),
+            Err(e) => {
+                // Fallback to temporary context on pool failure
+                warn!("Session pool failed, falling back to temporary context: {:?}", e);
+                self.embeddings_with_temporary_context(inputs, params)
+            }
+        }
+    }
+    
+    /// Generate embeddings using the session pool.
+    fn embeddings_with_pool(
+        &self,
+        inputs: &[impl AsRef<[u8]>],
+        params: EmbeddingsParams,
+    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        // Get session from pool
+        let session = self.get_pooled_embeddings_session()?;
+        
+        // Process with batching
+        let result = self.embeddings_with_session_batched(&*session, inputs, params);
+        
+        // Return session to pool
+        self.return_session_to_pool(session);
+        
+        result
+    }
+    
+    /// Fallback implementation using temporary context.
+    /// 
+    /// This preserves the original implementation for compatibility.
+    fn embeddings_with_temporary_context(
         &self,
         inputs: &[impl AsRef<[u8]>],
         params: EmbeddingsParams,
@@ -1063,6 +1199,212 @@ impl LlamaModel {
         })
         .await
         .map_err(|e| LlamaContextError::Unknown(e.to_string()))?
+    }
+
+    /// Process embeddings with session using optimized batching.
+    /// 
+    /// This internal method combines session reuse with batch optimization
+    /// for maximum efficiency.
+    fn embeddings_with_session_batched(
+        &self,
+        session: &LlamaSession,
+        inputs: &[impl AsRef<[u8]>],
+        params: EmbeddingsParams,
+    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
+        let _embeddings_lock = self.embeddings_mutex.lock().unwrap();
+        
+        // Save current mode to restore later
+        let was_in_embeddings_mode = session.inner.params.embedding;
+        session.set_embeddings_mode(true);
+        
+        // Classify and filter inputs
+        let classified_inputs = self.classify_inputs(inputs)?;
+        
+        // Calculate batch capacity based on session context size
+        let (valid_inputs, total_tokens, max_tokens) = self.analyze_classified_inputs(&classified_inputs);
+        let batch_capacity = self.calculate_session_batch_capacity(session, total_tokens, max_tokens)?;
+        
+        // Create optimized batches
+        let batches = self.create_session_batches(&valid_inputs, batch_capacity)?;
+        
+        // Process each batch and collect results
+        let mut all_embeddings = vec![vec![0.0f32; self.embedding_length]; inputs.len()];
+        
+        for batch in batches {
+            self.process_session_batch(session, &batch, &mut all_embeddings)?;
+        }
+        
+        // Restore previous mode
+        if !was_in_embeddings_mode {
+            session.set_embeddings_mode(false);
+        }
+        
+        Ok(all_embeddings)
+    }
+    
+    /// Analyze classified inputs to extract statistics.
+    fn analyze_classified_inputs(&self, classified: &[InputStatus]) -> (Vec<(usize, Vec<Token>)>, usize, usize) {
+        let mut valid_inputs = Vec::new();
+        let mut total_tokens = 0;
+        let mut max_tokens = 0;
+        
+        for (idx, status) in classified.iter().enumerate() {
+            if let InputStatus::Valid(tokens) = status {
+                total_tokens += tokens.len();
+                max_tokens = max_tokens.max(tokens.len());
+                valid_inputs.push((idx, tokens.clone()));
+            }
+        }
+        
+        (valid_inputs, total_tokens, max_tokens)
+    }
+    
+    /// Calculate optimal batch capacity for session.
+    fn calculate_session_batch_capacity(
+        &self,
+        session: &LlamaSession,
+        total_tokens: usize,
+        max_tokens: usize,
+    ) -> Result<usize, LlamaContextError> {
+        // Get session's actual context size
+        let session_context_size = session.inner.params.n_ctx as usize;
+        
+        let batch_capacity = if max_tokens > session_context_size {
+            warn!("Input exceeds session context size, will process in chunks");
+            session_context_size
+        } else {
+            min(session_context_size, total_tokens)
+        };
+        
+        Ok(batch_capacity)
+    }
+    
+    /// Create batches optimized for session processing.
+    fn create_session_batches(
+        &self,
+        valid_inputs: &[(usize, Vec<Token>)],
+        max_batch_tokens: usize,
+    ) -> Result<Vec<SessionEmbeddingBatch>, LlamaContextError> {
+        let mut batches = Vec::new();
+        let mut current_batch = SessionEmbeddingBatch::new();
+        let mut current_token_count = 0;
+        
+        for (input_idx, tokens) in valid_inputs {
+            if current_token_count > 0 && current_token_count + tokens.len() > max_batch_tokens {
+                // Finalize current batch
+                batches.push(current_batch);
+                current_batch = SessionEmbeddingBatch::new();
+                current_token_count = 0;
+            }
+            
+            current_batch.add_input(*input_idx, tokens.clone());
+            current_token_count += tokens.len();
+        }
+        
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+        
+        Ok(batches)
+    }
+    
+    /// Process a batch of embeddings using session.
+    fn process_session_batch(
+        &self,
+        session: &LlamaSession,
+        batch: &SessionEmbeddingBatch,
+        results: &mut [Vec<f32>],
+    ) -> Result<(), LlamaContextError> {
+        // Clear any previous context state
+        session.clear_kv_cache()?;
+        
+        // Process each input in the batch
+        for (input_idx, tokens) in &batch.inputs {
+            // Encode tokens for this input
+            session.encode_for_embeddings(tokens)?;
+            
+            // Extract embedding
+            let embedding = session.get_embeddings(self.embedding_length)?;
+            
+            // Store result at original index
+            results[*input_idx] = embedding;
+        }
+        
+        Ok(())
+    }
+
+    /// Get or create an embeddings session from the pool.
+    fn get_pooled_embeddings_session(&self) -> Result<Arc<LlamaSession>, LlamaContextError> {
+        // Initialize pool on first use
+        {
+            let mut pool_guard = self.embeddings_session_pool.write().unwrap();
+            if pool_guard.is_none() {
+                // Create pool with size based on available memory
+                let pool_size = self.calculate_optimal_pool_size();
+                *pool_guard = Some(EmbeddingsSessionPool::new(pool_size));
+            }
+        }
+        
+        // Try to get session from pool
+        let session = {
+            let mut pool_guard = self.embeddings_session_pool.write().unwrap();
+            pool_guard.as_mut().unwrap().get()
+        };
+        
+        match session {
+            Some(session) => {
+                // Reset session state for fresh use
+                session.clear_kv_cache()?;
+                Ok(session)
+            }
+            None => {
+                // Create new session if pool is empty
+                let params = SessionParams {
+                    embedding: true,
+                    ..Default::default()
+                };
+                let session = self.create_session(params)?;
+                Ok(Arc::new(session))
+            }
+        }
+    }
+    
+    /// Return a session to the pool for reuse.
+    fn return_session_to_pool(&self, session: Arc<LlamaSession>) {
+        let mut pool_guard = self.embeddings_session_pool.write().unwrap();
+        if let Some(pool) = pool_guard.as_mut() {
+            pool.put(session);
+        }
+    }
+    
+    /// Calculate optimal pool size based on available memory.
+    fn calculate_optimal_pool_size(&self) -> usize {
+        // Estimate memory per session using a sample input
+        let sample_tokens = vec![vec![Token(0); 100]];
+        let params = EmbeddingsParams::default();
+        let session_memory = self.estimate_embeddings_session_size(
+            &sample_tokens,
+            &params
+        ).host_memory;
+        
+        // Use at most 2GB for session pool by default
+        // This is reasonable for modern systems and allows ~20 sessions
+        // assuming ~100MB per session
+        let max_pool_memory = std::env::var("LLAMA_EMBEDDINGS_POOL_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048) * 1024 * 1024;
+        
+        // Calculate pool size with reasonable bounds
+        let pool_size = (max_pool_memory / session_memory)
+            .max(1)  // At least 1 session
+            .min(32); // Cap at 32 to prevent excessive resource use
+        
+        info!("Embeddings session pool: {} sessions ({} MB each, {} MB total)", 
+              pool_size, 
+              session_memory / (1024 * 1024),
+              (pool_size * session_memory) / (1024 * 1024));
+        pool_size
     }
 
     /// Return an estimation of how much memory embeddings generation is gonna require for the provided parameters and
