@@ -965,26 +965,8 @@ impl LlamaModel {
     /// Runs embeddings inference for the given inputs, returning the result.
     /// 
     /// This method now uses an internal session pool for improved performance
-    /// when called multiple times. The API remains unchanged for backwards
-    /// compatibility.
+    /// when called multiple times.
     pub fn embeddings(
-        &self,
-        inputs: &[impl AsRef<[u8]>],
-        params: EmbeddingsParams,
-    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
-        // Try session pool approach first
-        match self.embeddings_with_pool(inputs, params) {
-            Ok(embeddings) => Ok(embeddings),
-            Err(e) => {
-                // Fallback to temporary context on pool failure
-                warn!("Session pool failed, falling back to temporary context: {:?}", e);
-                self.embeddings_with_temporary_context(inputs, params)
-            }
-        }
-    }
-    
-    /// Generate embeddings using the session pool.
-    fn embeddings_with_pool(
         &self,
         inputs: &[impl AsRef<[u8]>],
         params: EmbeddingsParams,
@@ -999,92 +981,6 @@ impl LlamaModel {
         self.return_session_to_pool(session);
         
         result
-    }
-    
-    /// Fallback implementation using temporary context.
-    /// 
-    /// This preserves the original implementation for compatibility.
-    fn embeddings_with_temporary_context(
-        &self,
-        inputs: &[impl AsRef<[u8]>],
-        params: EmbeddingsParams,
-    ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
-        // Acquire the embeddings mutex to ensure only one embeddings operation runs at a time.
-        // This is necessary because llama.cpp doesn't support parallel inference.
-        let _embeddings_lock = self.embeddings_mutex.lock().unwrap();
-        
-        // Step 1: Classify all inputs
-        let classified = self.classify_inputs(inputs)?;
-        
-        // Step 2: Initialize results array with proper size
-        let mut results = vec![None; inputs.len()];
-        
-        // Step 3: Handle empty inputs by assigning zero embeddings
-        for (idx, status) in classified.iter().enumerate() {
-            if matches!(status, InputStatus::Empty) {
-                results[idx] = Some(vec![0.0f32; self.embedding_length]);
-            }
-        }
-        
-        // Step 4: Check if there are any valid inputs to process
-        let has_valid = classified.iter().any(|s| matches!(s, InputStatus::Valid(_)));
-        if !has_valid {
-            // All inputs are empty, return zero embeddings
-            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
-        }
-        
-        // Step 5: Calculate batch capacity
-        let mut total_tokens = 0;
-        let mut max_tokens = 0;
-        for status in &classified {
-            if let InputStatus::Valid(tokens) = status {
-                total_tokens += tokens.len();
-                max_tokens = max_tokens.max(tokens.len());
-            }
-        }
-        
-        let batch_capacity = if max_tokens > self.training_size {
-            warn!("Large embedding input requires a context larger than the model's training context.");
-            max_tokens
-        } else {
-            min(self.training_size, total_tokens)
-        };
-        
-        tracing::debug!(
-            "Embeddings: {} inputs, {} total tokens, batch_capacity={}",
-            inputs.len(),
-            total_tokens,
-            batch_capacity
-        );
-        
-        // Step 6: Create batches from classified inputs
-        let batches = self.create_batches(&classified, batch_capacity);
-        
-        if batches.is_empty() {
-            // No valid batches to process
-            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
-        }
-        
-        // Step 7: Create context for embeddings
-        let context = self.create_embeddings_context(batch_capacity, &params)?;
-        
-        // Step 8: Process each batch
-        for batch in batches {
-            let embeddings = self.process_batch(context, &batch)?;
-            
-            // Map embeddings back to original indices
-            for (i, &original_idx) in batch.input_indices.iter().enumerate() {
-                results[original_idx] = Some(embeddings[i].clone());
-            }
-        }
-        
-        // Step 9: Free context
-        unsafe {
-            llama_free(context);
-        }
-        
-        // Step 10: Convert Option<Vec<f32>> to Vec<Vec<f32>>
-        Ok(results.into_iter().map(|r| r.expect("All results should be set")).collect())
     }
 
     /// Runs embeddings inference for the given inputs, returning the result.
@@ -1209,7 +1105,7 @@ impl LlamaModel {
         &self,
         session: &LlamaSession,
         inputs: &[impl AsRef<[u8]>],
-        params: EmbeddingsParams,
+        _params: EmbeddingsParams,
     ) -> Result<Vec<Vec<f32>>, LlamaContextError> {
         let _embeddings_lock = self.embeddings_mutex.lock().unwrap();
         
@@ -1220,16 +1116,28 @@ impl LlamaModel {
         // Classify and filter inputs
         let classified_inputs = self.classify_inputs(inputs)?;
         
-        // Calculate batch capacity based on session context size
+        // Initialize results with proper handling of empty inputs
+        let mut all_embeddings = vec![vec![0.0f32; self.embedding_length]; inputs.len()];
+        
+        // Handle empty inputs by assigning zero embeddings (already done above)
+        // Now gather only valid inputs for processing
         let (valid_inputs, total_tokens, max_tokens) = self.analyze_classified_inputs(&classified_inputs);
+        
+        // If no valid inputs, return zero embeddings
+        if valid_inputs.is_empty() {
+            if !was_in_embeddings_mode {
+                session.set_embeddings_mode(false);
+            }
+            return Ok(all_embeddings);
+        }
+        
+        // Calculate batch capacity based on session context size
         let batch_capacity = self.calculate_session_batch_capacity(session, total_tokens, max_tokens)?;
         
         // Create optimized batches
         let batches = self.create_session_batches(&valid_inputs, batch_capacity)?;
         
         // Process each batch and collect results
-        let mut all_embeddings = vec![vec![0.0f32; self.embedding_length]; inputs.len()];
-        
         for batch in batches {
             self.process_session_batch(session, &batch, &mut all_embeddings)?;
         }
@@ -1269,8 +1177,10 @@ impl LlamaModel {
         // Get session's actual context size
         let session_context_size = session.inner.params.n_ctx as usize;
         
+        // Ensure batch capacity doesn't exceed context size
         let batch_capacity = if max_tokens > session_context_size {
-            warn!("Input exceeds session context size, will process in chunks");
+            info!("Some inputs exceed session context size ({} > {}), will handle appropriately", 
+                  max_tokens, session_context_size);
             session_context_size
         } else {
             min(session_context_size, total_tokens)
@@ -1315,13 +1225,26 @@ impl LlamaModel {
         batch: &SessionEmbeddingBatch,
         results: &mut [Vec<f32>],
     ) -> Result<(), LlamaContextError> {
-        // Clear any previous context state
-        session.clear_kv_cache()?;
+        // Get session context size
+        let context_size = session.inner.params.n_ctx as usize;
         
         // Process each input in the batch
         for (input_idx, tokens) in &batch.inputs {
-            // Encode tokens for this input
-            session.encode_for_embeddings(tokens)?;
+            // Clear any previous context state for each input
+            session.clear_kv_cache()?;
+            
+            // Check if tokens fit in context
+            if tokens.len() > context_size {
+                // For oversized inputs, we need to truncate or chunk
+                // For embeddings, truncation is more appropriate than chunking
+                warn!("Input with {} tokens exceeds context size {}, truncating", 
+                      tokens.len(), context_size);
+                let truncated = &tokens[..context_size];
+                session.encode_for_embeddings(truncated)?;
+            } else {
+                // Encode tokens for this input
+                session.encode_for_embeddings(tokens)?;
+            }
             
             // Extract embedding
             let embedding = session.get_embeddings(self.embedding_length)?;

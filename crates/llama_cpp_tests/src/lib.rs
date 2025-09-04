@@ -55,10 +55,11 @@ mod tests {
                     .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into()),
             );
 
-            tracing_subscriber::registry()
+            // Use try_init to avoid panic if already initialized
+            let _ = tracing_subscriber::registry()
                 .with(format)
                 .with(filter)
-                .init();
+                .try_init();
         }
     }
 

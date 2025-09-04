@@ -399,7 +399,12 @@ pub(crate) async fn run_embeddings_edge_case_test(
                 
                 // Check magnitude is reasonable (not necessarily normalized to 1)
                 let mag = sum.sqrt();
-                if mag < 0.01 {
+                
+                // For empty or whitespace-only inputs, zero magnitude is acceptable
+                let is_empty_input = idx < input.len() && 
+                    (input[idx].is_empty() || input[idx].trim().is_empty());
+                
+                if !is_empty_input && mag < 0.01 {
                     return Err(format!("Embedding {} has near-zero magnitude: {}", idx, mag).into());
                 }
                 if mag > 100.0 {
@@ -423,7 +428,7 @@ async fn test_embeddings_edge_cases_comprehensive() {
     use tracing_subscriber::util::SubscriberInitExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     
-    // Initialize tracing
+    // Initialize tracing (use try_init to avoid conflict)
     static SUBSCRIBER_SET: AtomicBool = AtomicBool::new(false);
     if !SUBSCRIBER_SET.swap(true, Ordering::SeqCst) {
         let format = tracing_subscriber::fmt::layer().compact();
@@ -432,10 +437,11 @@ async fn test_embeddings_edge_cases_comprehensive() {
                 .add_directive(tracing_subscriber::filter::LevelFilter::INFO.into()),
         );
 
-        tracing_subscriber::registry()
+        // Use try_init to avoid panic if already initialized
+        let _ = tracing_subscriber::registry()
             .with(format)
             .with(filter)
-            .init();
+            .try_init();
     }
     
     crate::ensure_test_models();
